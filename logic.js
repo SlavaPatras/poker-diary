@@ -1,7 +1,7 @@
 // Чистая логика покера: позиции, стек, раздача, статистика. Без DOM и хранилища.
 
 export const STREETS = ['preflop', 'flop', 'turn', 'river'];
-export const STREET_NAMES = { preflop: 'Префлоп', flop: 'Флоп', turn: 'Тёрн', river: 'Ривер' };
+export const STREET_NAMES = { preflop: 'Preflop', flop: 'Flop', turn: 'Turn', river: 'River' };
 export const RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
 export const SUITS = ['s', 'h', 'd', 'c'];
 export const SUIT_SYMBOLS = { s: '♠', h: '♥', d: '♦', c: '♣' };
@@ -320,18 +320,18 @@ export function computeStats(hands, { corrections = 0, correctionsBB = 0, hours 
 }
 
 const ACTION_WORDS = {
-  blind: 'блайнд', check: 'чек', call: 'колл', bet: 'ставка', raise: 'рейз', fold: 'фолд',
+  blind: 'blind', check: 'check', call: 'call', bet: 'bet', raise: 'raise', fold: 'fold',
 };
 
 export function actionText(a) {
   if (a.who === 'villain') {
-    const word = a.type === 'raise' ? 'рейз' : 'ставка';
-    return a.to === null ? `соперник: ${word}` : `соперник: ${word} ${a.to}`;
+    const word = a.type === 'raise' ? 'raise' : 'bet';
+    return a.to === null ? `opponent ${word}` : `opponent ${word} ${a.to}`;
   }
   if (a.type === 'fold' || a.type === 'check') return ACTION_WORDS[a.type];
-  if (a.type === 'blind') return `блайнд ${a.paid}`;
-  if (a.type === 'allin') return `олл-ин ${a.to}`;
-  if (a.type === 'call') return `колл ${a.to}`;
+  if (a.type === 'blind') return `blind ${a.paid}`;
+  if (a.type === 'allin') return `all-in ${a.to}`;
+  if (a.type === 'call') return `call ${a.to}`;
   return `${ACTION_WORDS[a.type]} ${a.to}`;
 }
 
@@ -354,11 +354,11 @@ export function handLines(h) {
 
 export function csvRows(sessions, hands) {
   const names = new Map(sessions.map((s) => [s.id, s.name]));
-  const rows = [['стол', 'раздача', 'позиция', 'карты', 'общие карты', 'итог', 'вскрытие', 'результат', 'стек до', 'стек после']];
+  const rows = [['table', 'hand', 'position', 'cards', 'board', 'outcome', 'showdown', 'result', 'stack before', 'stack after']];
   for (const h of hands) {
     rows.push([
       names.get(h.sessionId) ?? '', h.number, h.position, cardsText(h.cards), cardsText(h.board),
-      h.result, h.showdown ? 'да' : 'нет', h.net, h.stackBefore, h.stackBefore + h.net,
+      h.result, h.showdown ? 'yes' : 'no', h.net, h.stackBefore, h.stackBefore + h.net,
     ]);
   }
   return rows.map((r) => r.map((v) => `"${String(v).replaceAll('"', '""')}"`).join(',')).join('\n');
