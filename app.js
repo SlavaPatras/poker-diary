@@ -1,7 +1,7 @@
 import * as L from './logic.js';
 import * as store from './store.js';
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const MINUS = '−';
 const appEl = document.getElementById('app');
 const sheetEl = document.getElementById('sheet');
@@ -459,9 +459,9 @@ async function importData(file) {
 
 // Отрисовка
 
-const miniCard = (c) => (c
-  ? `<span class="pc s-${c[1]}">${c[0] === 'T' ? '10' : c[0]}<small>${L.SUIT_SYMBOLS[c[1]]}</small></span>`
-  : '<span class="pc blank"></span>');
+const rankText = (c) => (c[0] === 'T' ? '10' : c[0]);
+const cardFace = (c) => `<b>${rankText(c)}</b><i>${L.SUIT_SYMBOLS[c[1]]}</i>`;
+const miniCard = (c) => (c ? `<span class="pc s-${c[1]}">${cardFace(c)}</span>` : '<span class="pc blank"></span>');
 
 function rail(h) {
   const heroCards = [0, 1].map((i) => miniCard(h.cards[i])).join('');
@@ -474,7 +474,7 @@ function picker(h) {
   const tile = (rank, suit) => {
     const card = rank + suit;
     return `<button class="tile s-${suit}" data-a="card" data-v="${card}" ${used.has(card) ? 'disabled' : ''}
-      aria-label="${rank === 'T' ? '10' : rank}${L.SUIT_SYMBOLS[suit]}">${rank === 'T' ? '10' : rank}<small>${L.SUIT_SYMBOLS[suit]}</small></button>`;
+      aria-label="${rankText(card)}${L.SUIT_SYMBOLS[suit]}">${cardFace(card)}</button>`;
   };
   const blocks = L.SUITS.map((suit) => [
     ...L.RANKS.map((rank) => tile(rank, suit)),
@@ -568,7 +568,7 @@ function tableView(h, { anim = null } = {}) {
   } else if (anim?.type === 'win') {
     flying = [0, 1, 2, 3, 4, 5].map((i) => fly(center, seatPoint(h, h.seat), CHIP_COLORS.at(i % 5), i * 60)).join('');
   }
-  const board = [0, 1, 2, 3, 4].map((i) => miniCard(h.board[i])).join('');
+  const board = [0, 1, 2, 3, 4].map((i) => `<span class="slot">${h.board[i] ? miniCard(h.board[i]) : ''}</span>`).join('');
   const hidden = state.cardsHidden && h.cards.length;
   const mine = hidden ? '<span class="pc back"></span><span class="pc back"></span>' : [0, 1].map((i) => miniCard(h.cards[i])).join('');
   const heap = middle > 0 && anim?.type !== 'win'
