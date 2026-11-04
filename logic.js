@@ -32,6 +32,8 @@ export function blindType(players, seat) {
   return null;
 }
 
+const nextClockwise = (seat, players) => (seat >= players ? 1 : seat + 1);
+
 export function newHand({ id, session, number, players, seat, stack, now }) {
   const hand = {
     id,
@@ -54,13 +56,20 @@ export function newHand({ id, session, number, players, seat, stack, now }) {
     collected: 0,
     invested: 0,
     net: 0,
+    pot: 0,
     startedAt: now,
     endedAt: null,
   };
-  const blind = blindType(players, seat);
-  if (blind) {
-    const amount = Math.min(blind === 'sb' ? session.sb : session.bb, stack);
-    hand.actions.push({ street: 'preflop', who: 'hero', type: 'blind', to: amount, paid: amount });
+  for (let number = 1; number <= players; number += 1) {
+    const blind = blindType(players, number);
+    if (!blind) continue;
+    const size = blind === 'sb' ? session.sb : session.bb;
+    const hero = number === seat;
+    const amount = hero ? Math.min(size, stack) : size;
+    hand.actions.push({
+      street: 'preflop', who: hero ? 'hero' : 'villain', seat: number,
+      pos: positionFor(players, number), type: 'blind', to: amount, paid: amount,
+    });
   }
   return hand;
 }
@@ -73,74 +82,80 @@ export const stackLeft = (h) => h.stackBefore - invested(h);
 export const heroStreetTotal = (h, street = h.street) =>
   heroActions(h, street).reduce((sum, a) => sum + a.paid, 0);
 
-// Был ли у игрока выбор после блайнда: пока его нет, настройки стола ещё можно менять.
-export const hasDecided = (h) => h.actions.some((a) => a.who === 'hero' && a.type !== 'blind');
+// Пока никто не сделал ход, настройки стола ещё можно менять.
+export const hasDecided = (h) => h.actions.some((a) => a.type !== 'blind' && !a.pre);
 
-// Что нужно уравнять сейчас: { facing, to }. to === null — сумма соперника не введена.
-export function facing(h) {
-  const onStreet = h.actions.filter((a) => a.street === h.street);
-  const lastVillainIndex = onStreet.map((a) => a.who).lastIndexOf('villain');
-  const heroTotal = heroStreetTotal(h);
-  if (lastVillainIndex >= 0) {
-    const villain = onStreet[lastVillainIndex];
-    const heroAfter = onStreet.slice(lastVillainIndex + 1).some((a) => a.who === 'hero');
-    if (villain.to === null) return { facing: !heroAfter, to: null };
-    return { facing: villain.to > heroTotal, to: villain.to };
-  }
-  if (h.street === 'preflop') return { facing: heroTotal < h.bb, to: h.bb };
-  return { facing: false, to: 0 };
-}
+// Полная картина стола восстанавливается из записанных действий.
+export function tableState(h) {
+  const n = h.players;
+  const seats = Array.from({ length: n }, (_, i) => ({
+    seat: i + 1, position: positionFor(n, i + 1), folded: false, allin: false, bet: 0, total: 0, last: null,
+  }));
+  const at = (seat) => seats[seat - 1];
+  const street = h.street;
+  let bet = street === 'preflop' ? h.bb : 0;
+  const acted = new Set();
+  let lastSeat = null;
 
-export function heroOptions(h) {
-  if (facing(h).facing) return ['fold', 'call', 'raise', 'allin'];
-  return ['check', h.street === 'preflop' ? 'raise' : 'bet', 'allin'];
-}
-
-export function setRaisedBefore(h, value, to = null) {
-  h.actions = h.actions.filter((a) => !a.pre);
-  h.raisedBefore = value;
-  if (value) h.actions.push({ street: 'preflop', who: 'villain', type: 'raise', to, pre: true });
-}
-
-export function villainBet(h, to = null) {
-  const opened = h.street === 'preflop' ||
-    h.actions.some((a) => a.street === h.street && ['bet', 'raise', 'allin'].includes(a.type));
-  h.actions.push({ street: h.street, who: 'villain', type: opened ? 'raise' : 'bet', to });
-  h.phase = 'decide';
-}
-
-function allinKind(h) {
-  const f = facing(h);
-  if (!f.facing) return h.street === 'preflop' ? 'raise' : 'bet';
-  if (f.to === null) return 'raise';
-  return heroStreetTotal(h) + stackLeft(h) > f.to ? 'raise' : 'call';
-}
-
-// to — сумма игрока на этой улице («до»). Сумма выше стека становится олл-ином.
-export function heroAction(h, type, to) {
-  const total = heroStreetTotal(h);
-  if (type === 'fold' || type === 'check') {
-    h.actions.push({ street: h.street, who: 'hero', type, to: total, paid: 0 });
-  } else {
-    const left = stackLeft(h);
-    if (type === 'allin') {
-      const as = allinKind(h);
-      h.actions.push({ street: h.street, who: 'hero', type, as, to: total + left, paid: left });
-    } else {
-      const wanted = Math.max(0, to - total);
-      const paid = Math.min(wanted, left);
-      const action = { street: h.street, who: 'hero', type, to: total + paid, paid };
-      if (paid === left && paid > 0) {
-        action.as = type;
-        action.type = 'allin';
-      }
-      h.actions.push(action);
+  for (const a of h.actions) {
+    if (!a.seat || a.pre) continue;
+    const seat = at(a.seat);
+    seat.total += a.paid;
+    if (a.type === 'fold') seat.folded = true;
+    if (a.type === 'allin') seat.allin = true;
+    if (a.street !== street) continue;
+    seat.bet += a.paid;
+    if (a.type === 'blind') continue;
+    seat.last = a;
+    lastSeat = a.seat;
+    acted.add(a.seat);
+    if (seat.bet > bet) {
+      bet = seat.bet;
+      acted.clear();
+      acted.add(a.seat);
     }
   }
-  h.phase = 'next';
+
+  if (h.stackBefore - seats[h.seat - 1].total <= 0) seats[h.seat - 1].allin = true;
+  const canAct = (s) => !s.folded && !s.allin;
+  const open = seats.filter(canAct);
+  const needs = (s) => canAct(s) && (!acted.has(s.seat) || s.bet < bet);
+  const alone = open.length <= 1 && open.every((s) => s.bet >= bet);
+  let first = street === 'preflop' ? (n === 2 ? 1 : nextClockwise(3, n)) : 2;
+  if (lastSeat) first = nextClockwise(lastSeat, n);
+  let actor = null;
+  if (!alone) {
+    for (let i = 0, seat = first; i < n; i += 1, seat = nextClockwise(seat, n)) {
+      if (needs(at(seat))) { actor = seat; break; }
+    }
+  }
+  return {
+    seats, street, bet, actor,
+    pot: seats.reduce((sum, s) => sum + s.total, 0),
+    active: seats.filter((s) => !s.folded).length,
+    hero: at(h.seat),
+  };
 }
 
-export function nextStreet(h) {
+export function optionsFor(h, seat) {
+  const st = tableState(h);
+  const owes = st.bet > st.seats[seat - 1].bet;
+  if (owes) return ['fold', 'call', 'raise', 'allin'];
+  return ['check', st.bet > 0 ? 'raise' : 'bet', 'allin'];
+}
+
+// Для быстрого сброса с первого экрана: остальные ходы до тебя тогда не вводятся.
+export function setRaisedBefore(h, value) {
+  h.actions = h.actions.filter((a) => !a.pre);
+  h.raisedBefore = value;
+  if (value) h.actions.push({ street: 'preflop', who: 'villain', type: 'raise', to: null, pre: true });
+}
+
+function advance(h) {
+  const st = tableState(h);
+  if (st.hero.folded) return;
+  if (st.active === 1) { h.autoWin = true; return; }
+  if (st.actor !== null) { h.phase = 'table'; return; }
   const index = STREETS.indexOf(h.street);
   if (index === STREETS.length - 1) {
     h.showdown = true;
@@ -151,15 +166,67 @@ export function nextStreet(h) {
   h.phase = 'board';
 }
 
+// to — сумма игрока на этой улице («до»).
+export function act(h, seat, type, to) {
+  const st = tableState(h);
+  const player = st.seats[seat - 1];
+  const hero = seat === h.seat;
+  const base = {
+    street: h.street, who: hero ? 'hero' : 'villain', seat, pos: player.position,
+  };
+  if (type === 'fold' || type === 'check') {
+    h.actions.push({ ...base, type, to: player.bet, paid: 0 });
+  } else {
+    const left = hero ? stackLeft(h) : Infinity;
+    let target = player.bet + left;
+    if (type === 'call') target = st.bet;
+    else if (type !== 'allin' || !hero) target = to;
+    const paid = Math.min(Math.max(0, target - player.bet), left);
+    const total = player.bet + paid;
+    const kindOf = total <= st.bet ? 'call' : st.bet > 0 ? 'raise' : 'bet';
+    const action = { ...base, type, to: total, paid };
+    if (type === 'allin') action.as = kindOf;
+    else if (hero && paid === left && paid > 0) { action.as = type; action.type = 'allin'; }
+    h.actions.push(action);
+  }
+  advance(h);
+}
+
+export function foldToHero(h) {
+  for (let i = 0; i < h.players; i += 1) {
+    const { actor } = tableState(h);
+    if (actor === null || actor === h.seat) break;
+    h.actions.push({
+      street: h.street, who: 'villain', seat: actor, pos: positionFor(h.players, actor),
+      type: 'fold', to: 0, paid: 0,
+    });
+  }
+  advance(h);
+}
+
 export const boardNeeded = (h) => ({ flop: 3, turn: 4, river: 5 }[h.street] ?? 0);
+
+export function addBoardCard(h, card) {
+  h.board.push(card);
+  if (h.board.length >= boardNeeded(h)) { h.phase = 'table'; advance(h); }
+}
 
 // Пропущенные общие карты остаются пустыми, чтобы следующие улицы не сдвинулись.
 export function skipBoard(h) {
   while (h.board.length < boardNeeded(h)) h.board.push(null);
-  h.phase = 'decide';
+  h.phase = 'table';
+  advance(h);
+}
+
+export function startTable(h) {
+  setRaisedBefore(h, false);
+  h.phase = 'table';
+  advance(h);
 }
 
 export function finishHand(h, { result, collected = 0, showdown = h.showdown }, now) {
+  h.pot = tableState(h).pot;
+  delete h.autoWin;
   h.result = result;
   h.collected = result === 'won' || result === 'split' ? collected : 0;
   h.showdown = result === 'folded' ? false : showdown;
@@ -209,7 +276,8 @@ function firstDecision(h) {
   const preflop = h.actions.filter((a) => a.street === 'preflop' && a.type !== 'blind');
   const index = preflop.findIndex((a) => a.who === 'hero');
   if (index < 0) return null;
-  return { action: preflop[index], facedRaise: preflop.slice(0, index).some((a) => a.who === 'villain') };
+  const raised = preflop.slice(0, index).some((a) => a.who === 'villain' && kind(a) === 'raise');
+  return { action: preflop[index], facedRaise: raised };
 }
 
 function checkRaiseStreets(h) {
@@ -219,7 +287,7 @@ function checkRaiseStreets(h) {
     const list = h.actions.filter((a) => a.street === street && a.type !== 'blind' && !a.pre);
     const check = list.findIndex((a) => a.who === 'hero' && a.type === 'check');
     if (check < 0) continue;
-    const villain = list.findIndex((a, i) => i > check && a.who === 'villain');
+    const villain = list.findIndex((a, i) => i > check && a.who === 'villain' && ['bet', 'raise'].includes(kind(a)));
     if (villain < 0) continue;
     const reply = list.find((a, i) => i > villain && a.who === 'hero');
     if (!reply) continue;
@@ -319,20 +387,11 @@ export function computeStats(hands, { corrections = 0, correctionsBB = 0, hours 
   };
 }
 
-const ACTION_WORDS = {
-  blind: 'blind', check: 'check', call: 'call', bet: 'bet', raise: 'raise', fold: 'fold',
-};
-
 export function actionText(a) {
-  if (a.who === 'villain') {
-    const word = a.type === 'raise' ? 'raise' : 'bet';
-    return a.to === null ? `opponent ${word}` : `opponent ${word} ${a.to}`;
-  }
-  if (a.type === 'fold' || a.type === 'check') return ACTION_WORDS[a.type];
-  if (a.type === 'blind') return `blind ${a.paid}`;
-  if (a.type === 'allin') return `all-in ${a.to}`;
-  if (a.type === 'call') return `call ${a.to}`;
-  return `${ACTION_WORDS[a.type]} ${a.to}`;
+  const words = { fold: 'fold', check: 'check', call: 'call', bet: 'bet', raise: 'raise', allin: 'all-in', blind: 'blind' };
+  const who = a.who === 'villain' ? `${a.pos ?? 'opponent'} ` : '';
+  const amount = a.to === null || a.type === 'fold' || a.type === 'check' ? '' : ` ${a.type === 'blind' ? a.paid : a.to}`;
+  return `${who}${words[a.type]}${amount}`;
 }
 
 const cardText = (c) => (c[0] === 'T' ? '10' : c[0]) + SUIT_SYMBOLS[c[1]];
@@ -342,7 +401,7 @@ export function handLines(h) {
   const lines = [];
   const counts = { flop: [0, 3], turn: [3, 4], river: [4, 5] };
   for (const street of STREETS) {
-    const list = h.actions.filter((a) => a.street === street);
+    const list = h.actions.filter((a) => a.street === street && !(a.who === 'villain' && a.type === 'blind'));
     const range = counts[street];
     const cards = range ? h.board.slice(range[0], range[1]) : [];
     if (!list.length && !cards.length) continue;

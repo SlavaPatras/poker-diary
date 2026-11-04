@@ -1,7 +1,7 @@
 import * as L from './logic.js';
 import * as store from './store.js';
 
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 const MINUS = '−';
 const appEl = document.getElementById('app');
 const sheetEl = document.getElementById('sheet');
@@ -19,6 +19,7 @@ const state = {
   sheet: null,
   updateReady: false,
   storageError: false,
+  anim: null,
 };
 
 const uid = () => crypto.randomUUID();
@@ -69,8 +70,21 @@ function ensureDraft(s) {
 // Каждый шаг раздачи сразу сохраняется и его можно отменить.
 function step(work) {
   const s = current();
-  s.undo = [...(s.undo ?? []).slice(-40), clone(s.draft)];
+  const before = clone(s.draft);
+  const prev = L.tableState(before);
+  s.undo = [...(s.undo ?? []).slice(-60), before];
   work(s.draft);
+  const h = s.draft;
+  if (h.street !== before.street) {
+    state.anim = { type: 'collect', seats: prev.seats.filter((x) => x.bet > 0).map((x) => x.seat) };
+  } else {
+    const last = h.actions.at(-1);
+    if (h.actions.length > before.actions.length && last.paid > 0) state.anim = { type: 'bet', seat: last.seat };
+  }
+  if (h.autoWin) {
+    finish(s, { result: 'won', collected: L.tableState(h).pot, showdown: false }, before);
+    return;
+  }
   saveSession(s);
   render();
 }
@@ -88,6 +102,7 @@ function finish(s, outcome, before) {
   ensureDraft(s);
   saveSession(s);
   state.sheet = null;
+  state.anim = h.net > 0 ? { type: 'win' } : null;
   render();
 }
 
@@ -102,14 +117,22 @@ function openAmount(options) {
   renderSheet();
 }
 
-function quickAmounts(h, withCall) {
-  const list = [
-    { label: '2 BB', value: h.bb * 2 },
-    { label: '3 BB', value: h.bb * 3 },
-  ];
-  const villain = h.actions.filter((a) => a.street === h.street && a.who === 'villain').at(-1);
-  if (withCall && villain?.to) list.push({ label: `Opponent ${villain.to}`, value: villain.to });
-  list.push({ label: 'All-in', value: L.heroStreetTotal(h) + L.stackLeft(h) });
+function quickAmounts(h, seat) {
+  const st = L.tableState(h);
+  const round = (v) => Math.max(1, Math.round(v));
+  let list;
+  if (st.street === 'preflop' && st.bet <= h.bb) {
+    list = [2, 3, 4].map((x) => ({ label: `${x} BB`, value: h.bb * x }));
+  } else if (st.bet > 0) {
+    list = [2, 3, 4].map((x) => ({ label: `×${x}`, value: st.bet * x }));
+  } else {
+    list = [
+      { label: '½ pot', value: round(st.pot / 2) },
+      { label: '⅔ pot', value: round((st.pot * 2) / 3) },
+      { label: 'Pot', value: round(st.pot) },
+    ];
+  }
+  if (seat === h.seat) list.push({ label: 'All-in', value: st.hero.bet + L.stackLeft(h) });
   return list;
 }
 
@@ -167,60 +190,50 @@ const handlers = {
     const card = el.dataset.v;
     if (h.phase === 'cards') {
       h.cards.push(card);
-      if (h.cards.length === 2) h.phase = 'decide';
+      if (h.cards.length === 2) L.startTable(h);
     } else {
-      h.board.push(card);
-      if (h.board.length >= L.boardNeeded(h)) h.phase = 'decide';
+      L.addBoardCard(h, card);
     }
   }),
-  skipCards: () => step((h) => { h.phase = 'decide'; }),
+  skipCards: () => step((h) => L.startTable(h)),
   skipBoard: () => step((h) => L.skipBoard(h)),
   toggleRaised: () => step((h) => L.setRaisedBefore(h, !h.raisedBefore)),
-  raiseAmount: () => {
-    const h = current().draft;
-    openAmount({
-      title: 'Raise before you', quick: [{ label: '2 BB', value: h.bb * 2 }, { label: '3 BB', value: h.bb * 3 }],
-      min: h.bb + 1, ok: (v) => { closeSheet(); step((d) => L.setRaisedBefore(d, true, v)); },
-    });
-  },
   fold: () => {
     const s = current();
-    const before = clone(s.draft);
-    L.heroAction(s.draft, 'fold');
+    const h = s.draft;
+    const before = clone(h);
+    const seat = L.tableState(h).actor ?? h.seat;
+    if (h.phase !== 'cards' && seat !== h.seat) { step((d) => L.act(d, seat, 'fold')); return; }
+    L.act(h, h.seat, 'fold');
     finish(s, { result: 'folded' }, before);
   },
-  check: () => step((h) => L.heroAction(h, 'check')),
-  allin: () => step((h) => L.heroAction(h, 'allin')),
-  call: () => {
+  foldToHero: () => step((h) => L.foldToHero(h)),
+  check: () => { const seat = L.tableState(current().draft).actor; step((h) => L.act(h, seat, 'check')); },
+  call: () => { const seat = L.tableState(current().draft).actor; step((h) => L.act(h, seat, 'call')); },
+  allin: () => {
     const h = current().draft;
-    const f = L.facing(h);
-    if (f.to !== null) { step((d) => L.heroAction(d, 'call', f.to)); return; }
+    const st = L.tableState(h);
+    const seat = st.actor;
+    if (seat === h.seat) { step((d) => L.act(d, seat, 'allin')); return; }
     openAmount({
-      title: 'Call to what amount', hint: hintFor(h), quick: quickAmounts(h, false), min: L.heroStreetTotal(h) + 1,
-      ok: (v) => { closeSheet(); step((d) => L.heroAction(d, 'call', v)); },
+      title: `${L.positionFor(h.players, seat)} all-in, total on this street`, min: st.seats[seat - 1].bet + 1,
+      ok: (v) => { closeSheet(); step((d) => L.act(d, seat, 'allin', v)); },
     });
   },
   raise: (el) => {
     const h = current().draft;
     const type = el.dataset.v;
-    const f = L.facing(h);
-    const min = Math.max(L.heroStreetTotal(h), f.to ?? 0) + 1;
-    const allIn = L.heroStreetTotal(h) + L.stackLeft(h);
+    const st = L.tableState(h);
+    const seat = st.actor;
+    const name = seat === h.seat ? 'You' : L.positionFor(h.players, seat);
+    const allIn = seat === h.seat ? st.hero.bet + L.stackLeft(h) : Infinity;
     openAmount({
-      title: type === 'bet' ? 'Bet' : 'Raise to', hint: hintFor(h), quick: quickAmounts(h, true), min: Math.min(min, allIn),
-      ok: (v) => { closeSheet(); step((d) => L.heroAction(d, type, v)); },
+      title: `${name}: ${type === 'bet' ? 'bet' : 'raise to'}`,
+      hint: seat === h.seat ? hintFor(h) : `Pot ${st.pot}.`,
+      quick: quickAmounts(h, seat), min: Math.min(st.bet + 1, allIn),
+      ok: (v) => { closeSheet(); step((d) => L.act(d, seat, type, v)); },
     });
   },
-  villain: () => {
-    const h = current().draft;
-    openAmount({
-      title: 'Opponent bet', hint: 'Total on this street, optional.',
-      quick: [{ label: '2 BB', value: h.bb * 2 }, { label: '3 BB', value: h.bb * 3 }],
-      min: 1, skip: 'No amount',
-      ok: (v) => { closeSheet(); step((d) => L.villainBet(d, v)); },
-    });
-  },
-  nextStreet: () => step((h) => L.nextStreet(h)),
   handOver: () => step((h) => { h.phase = 'result'; }),
   showdown: () => step((h) => { h.showdown = !h.showdown; }),
   lost: () => {
@@ -230,9 +243,11 @@ const handlers = {
   collect: (el) => {
     const s = current();
     const result = el.dataset.v;
+    const { pot } = L.tableState(s.draft);
     openAmount({
-      title: result === 'won' ? 'Chips collected' : 'Chips received',
-      hint: `Include your own bet. You put in ${L.invested(s.draft)}.`, min: 1,
+      title: result === 'won' ? 'Chips collected' : 'Your share of the pot',
+      value: result === 'won' ? pot : Math.floor(pot / 2), min: 1,
+      hint: `Pot ${pot}, you put in ${L.invested(s.draft)}. Change this if there was a side pot.`,
       ok: (v) => finish(s, { result, collected: v }, clone(s.draft)),
     });
   },
@@ -249,7 +264,6 @@ const handlers = {
     state.hands = state.hands.filter((h) => h.id !== id);
     guard(store.deleteHand(id));
     s.draft = before;
-    s.draft.stackBefore = L.currentStack(s, handsOf(s.id));
     s.seat = before.seat;
     s.players = before.players;
     s.lastDraft = null;
@@ -258,6 +272,7 @@ const handlers = {
     saveSession(s);
     render();
   },
+  log: () => { state.sheet = { type: 'log' }; renderSheet(); },
 
   // Стол
   menu: () => { state.sheet = { type: 'menu' }; renderSheet(); },
@@ -314,7 +329,7 @@ const handlers = {
       s.draft.number = old.number;
       s.draft.cards = old.cards;
       s.draft.phase = old.phase;
-      if (old.raisedBefore) L.setRaisedBefore(s.draft, true, old.actions.find((a) => a.pre)?.to ?? null);
+      if (old.raisedBefore) L.setRaisedBefore(s.draft, true);
     }
     saveSession(s);
     state.sheet = null;
@@ -465,6 +480,83 @@ function log(h) {
   return `<ul class="log">${lines.map((l) => `<li><b>${esc(l.title)}:</b> ${esc(l.text) || '<span class="muted">no actions</span>'}</li>`).join('')}</ul>`;
 }
 
+const EMBLEM = `<svg class="emblem" viewBox="0 0 200 200" aria-hidden="true">
+  <circle cx="100" cy="100" r="92" fill="none" stroke="#000" stroke-width="5"/>
+  <circle cx="100" cy="100" r="80" fill="none" stroke="#000" stroke-width="1.5"/>
+  <path fill="#000" d="M100 36c10 20 52 42 52 74 0 18-14 28-27 28-8 0-14-3-19-8 2 14 7 22 18 30H76c11-8 16-16 18-30-5 5-11 8-19 8-13 0-27-10-27-28 0-32 42-54 52-74z"/>
+</svg>`;
+
+function seatPoint(h, seat) {
+  const offset = ((seat - h.seat) % h.players + h.players) % h.players;
+  const angle = Math.PI / 2 + (offset * 2 * Math.PI) / h.players;
+  return { x: 50 + 39 * Math.cos(angle), y: 49 + 43 * Math.sin(angle), hero: offset === 0 };
+}
+const betPoint = (p) => (p.hero
+  ? { x: 34, y: 74 }
+  : { x: 50 + (p.x - 50) * 0.6, y: 49 + (p.y - 49) * 0.66 });
+
+const CHIP_COLORS = ['#f0a593', '#f2c53d', '#2f4fc4', '#6b3fa0', '#f4efe4'];
+const chipColor = (amount, bb) => CHIP_COLORS.at(Math.min(4, Math.floor(Math.log2(Math.max(1, amount / bb) + 1))));
+const chipDot = (color) => `<i class="chip" style="--c:${color}"></i>`;
+const fly = (from, to, color) => `<span class="fly" style="--x0:${from.x}%;--y0:${from.y}%;--x1:${to.x}%;--y1:${to.y}%;--c:${color}"></span>`;
+
+function tableView(h) {
+  const st = L.tableState(h);
+  const anim = state.anim;
+  state.anim = null;
+  const center = { x: 50, y: 49 };
+  const seats = st.seats.map((p) => {
+    const at = seatPoint(h, p.seat);
+    const word = p.folded ? 'Folded' : p.allin ? 'All-in' : p.last ? { check: 'Check', call: 'Call', bet: 'Bet', raise: 'Raise' }[p.last.type] ?? '' : '';
+    const cls = [at.hero ? 'me' : '', p.folded ? 'out' : '', st.actor === p.seat ? 'acting' : ''].join(' ');
+    return `<div class="tseat ${cls}" style="left:${at.x}%;top:${at.y}%"><b>${at.hero ? 'You' : p.position}</b>${at.hero ? `<small>${p.position}</small>` : `<small>${word || '&nbsp;'}</small>`}</div>`;
+  }).join('');
+  const bets = st.seats.filter((p) => p.bet > 0).map((p) => {
+    const spot = betPoint(seatPoint(h, p.seat));
+    return `<div class="tbet" style="left:${spot.x}%;top:${spot.y}%">${chipDot(chipColor(p.bet, h.bb))}${p.bet}</div>`;
+  }).join('');
+  let flying = '';
+  if (anim?.type === 'bet') {
+    const from = seatPoint(h, anim.seat);
+    flying = fly(from, betPoint(from), CHIP_COLORS[1]);
+  } else if (anim?.type === 'collect') {
+    flying = anim.seats.map((seat, i) => fly(betPoint(seatPoint(h, seat)), center, CHIP_COLORS[i % 5])).join('');
+  } else if (anim?.type === 'win') {
+    flying = [0, 1, 2, 3].map((i) => fly(center, seatPoint(h, h.seat), CHIP_COLORS[i])).join('');
+  }
+  const board = [0, 1, 2, 3, 4].map((i) => miniCard(h.board[i])).join('');
+  return `<div class="felt">
+    <div class="rim">${EMBLEM}</div>
+    <div class="tcenter"><div class="tboard">${board}</div><div class="tpot">Pot ${num(st.pot)}</div></div>
+    ${bets}${seats}${flying}
+    <div class="tcards">${[0, 1].map((i) => miniCard(h.cards[i])).join('')}</div>
+  </div>`;
+}
+
+function actionBar(h) {
+  const st = L.tableState(h);
+  const seat = st.actor;
+  if (seat === null) return '';
+  const hero = seat === h.seat;
+  const player = st.seats[seat - 1];
+  const cost = st.bet - player.bet;
+  const options = L.optionsFor(h, seat);
+  const callText = hero ? Math.min(cost, L.stackLeft(h)) : st.bet;
+  const buttons = {
+    fold: '<button class="act red" data-a="fold">Fold</button>',
+    check: '<button class="act ivory" data-a="check">Check</button>',
+    call: `<button class="act ivory" data-a="call">Call ${st.bet}<small>costs ${callText === st.bet ? cost : callText}</small></button>`,
+    raise: '<button class="act gold" data-a="raise" data-v="raise">Raise</button>',
+    bet: '<button class="act gold" data-a="raise" data-v="bet">Bet</button>',
+    allin: `<button class="act" data-a="allin">All-in${hero ? `<small>${L.stackLeft(h)}</small>` : ''}</button>`,
+  };
+  const quick = !hero && !st.hero.folded && cost > 0
+    ? '<button class="act low wide" data-a="foldToHero">Everyone folds to me</button>' : '';
+  return `<div class="turn"><span>${hero ? '<b>Your turn</b>' : `<b>${player.position}</b> to act`}</span>
+      <span><button class="link small" data-a="log">Log</button> <button class="link small" data-a="handOver">End hand</button></span></div>
+    <div class="choices">${options.map((o) => buttons[o]).join('')}${quick}</div>`;
+}
+
 function handView(s) {
   const h = s.draft;
   if (!h) {
@@ -473,71 +565,39 @@ function handView(s) {
       <button class="secondary" data-a="submit">End session</button>
       <button class="link" data-a="home">Home</button></div></div>`;
   }
-  const f = L.facing(h);
   const canUndo = (s.undo ?? []).length > 0;
-  const preDecision = h.street === 'preflop' && !L.hasDecided(h);
   const last = handsOf(s.id).find((x) => x.id === s.lastHandId);
-  let body = '';
-  let foot = '';
+  const header = `<div class="handtop">
+      <button class="disc ${h.position.length > 3 ? 'long' : ''}" data-a="home" aria-label="Home, position ${h.position}"><span>${h.position}</span><small>SLOWPLAY</small></button>
+      <div class="handinfo"><b>${num(L.stackLeft(h))}</b><span class="muted small">Hand ${h.number}, blinds ${h.sb}/${h.bb}</span></div>
+      <div class="topactions"><button data-a="menu">Table</button>
+      <button data-a="undo" ${canUndo ? '' : 'disabled'}>Undo</button></div>
+    </div>`;
 
   if (h.phase === 'cards') {
-    body = `${raisedToggle(h)}${picker(h)}`;
-    foot = `${last && s.lastDraft ? `<div class="lasthand"><span>Hand ${last.number}: ${signed(last.net)}</span><button class="link small" data-a="undoHand">Restore</button></div>` : ''}
-      <div class="choices"><button class="act red" data-a="fold">Fold</button>
-      <button class="act low" data-a="skipCards">No cards</button></div>`;
-  } else if (h.phase === 'board') {
+    const lastLine = last && s.lastDraft
+      ? `<div class="lasthand"><span>Hand ${last.number}: ${signed(last.net)}</span><button class="link small" data-a="undoHand">Restore</button></div>` : '';
+    state.anim = null;
+    return `<div class="hand">${header}${rail(h)}
+      <div class="handbody">${raisedToggle(h)}${picker(h)}</div>
+      <div class="handfoot">${lastLine}<div class="choices"><button class="act red" data-a="fold">Fold</button>
+      <button class="act low" data-a="skipCards">No cards</button></div></div></div>`;
+  }
+  if (h.phase === 'board') {
     const left = L.boardNeeded(h) - h.board.length;
-    body = `<p class="prompt">${L.STREET_NAMES[h.street]}: ${left === 1 ? 'pick a card' : `pick ${left} more`}</p>${picker(h)}`;
-    foot = '<button class="act low" style="width:100%" data-a="skipBoard">Skip cards</button>';
-  } else if (h.phase === 'decide') {
-    const toggle = preDecision ? raisedToggle(h) : '';
-    const preRaise = h.actions.find((a) => a.pre);
-    const amount = preRaise && preDecision
-      ? `<button class="link" data-a="raiseAmount">${preRaise.to ? `Raise amount: ${preRaise.to}` : 'Add raise amount'}</button>` : '';
-    body = `${toggle}${amount}${log(h)}`;
-    const opts = L.heroOptions(h);
-    const buttons = {
-      fold: '<button class="act red" data-a="fold">Fold</button>',
-      check: '<button class="act ivory" data-a="check">Check</button>',
-      call: () => {
-        const paid = f.to === null ? null : Math.min(f.to - L.heroStreetTotal(h), L.stackLeft(h));
-        return `<button class="act ivory" data-a="call">Call${f.to ? ` ${f.to}` : ''}${paid !== null ? `<small>costs ${paid}</small>` : ''}</button>`;
-      },
-      raise: '<button class="act gold" data-a="raise" data-v="raise">Raise</button>',
-      bet: '<button class="act gold" data-a="raise" data-v="bet">Bet</button>',
-      allin: `<button class="act" data-a="allin">All-in<small>${L.stackLeft(h)}</small></button>`,
-    };
-    foot = `<div class="choices">${opts.map((o) => (typeof buttons[o] === 'function' ? buttons[o]() : buttons[o])).join('')}
-      ${!f.facing && h.street !== 'preflop' ? '<button class="act low" data-a="villain">Opponent bet</button>' : ''}
-      ${h.street === 'preflop' && !f.facing ? '<button class="act low" data-a="handOver">Everyone folded</button>' : ''}</div>`;
-  } else if (h.phase === 'next') {
-    body = log(h);
-    const river = h.street === 'river';
-    foot = `<p class="prompt">What’s next?</p><div class="choices">
-      <button class="act gold wide" data-a="villain">Opponent bet</button>
-      <button class="act ivory" data-a="nextStreet">${river ? 'Showdown' : 'Next street'}</button>
-      <button class="act" data-a="handOver">Hand over</button></div>`;
-  } else if (h.phase === 'result') {
-    body = log(h);
-    foot = `<p class="prompt">Hand result</p>
-      <button class="toggle" data-a="showdown" aria-pressed="${h.showdown}"><span>Went to showdown</span><i></i></button>
+    state.anim = null;
+    return `<div class="hand">${header}${rail(h)}
+      <div class="handbody"><p class="prompt">${L.STREET_NAMES[h.street]}: ${left === 1 ? 'pick a card' : `pick ${left} more`}</p>${picker(h)}</div>
+      <div class="handfoot"><button class="act low" style="width:100%" data-a="skipBoard">Skip cards</button></div></div>`;
+  }
+  let foot = actionBar(h);
+  if (h.phase === 'result') {
+    foot = `<button class="toggle" data-a="showdown" aria-pressed="${h.showdown}"><span>Went to showdown</span><i></i></button>
       <div class="choices"><button class="act gold wide" data-a="collect" data-v="won">Won</button>
       <button class="act red" data-a="lost">Lost<small>${MINUS}${L.invested(h)}</small></button>
       <button class="act" data-a="collect" data-v="split">Split pot</button></div>`;
   }
-
-  const left = L.stackLeft(h);
-  return `<div class="hand">
-    <div class="handtop">
-      <button class="disc ${h.position.length > 3 ? 'long' : ''}" data-a="home" aria-label="Home, position ${h.position}"><span>${h.position}</span><small>SLOWPLAY</small></button>
-      <div class="handinfo"><b>${num(left)}</b><span class="muted small">Hand ${h.number}, blinds ${h.sb}/${h.bb}</span></div>
-      <div class="topactions"><button data-a="menu">Table</button>
-      <button data-a="undo" ${canUndo ? '' : 'disabled'}>Undo</button></div>
-    </div>
-    ${rail(h)}
-    <div class="handbody">${body}</div>
-    <div class="handfoot">${foot}</div>
-  </div>`;
+  return `<div class="hand">${header}${tableView(h)}<div class="handfoot">${foot}</div></div>`;
 }
 
 function homeView() {
@@ -765,6 +825,11 @@ function renderSheet() {
       <p>${h.position}, ${esc(L.cardsText(h.cards) || 'no cards')}, blinds ${h.sb}/${h.bb}</p>
       <ul class="log" style="margin:10px 0">${lines.map((l) => `<li><b>${esc(l.title)}:</b> ${esc(l.text) || 'no actions'}</li>`).join('')}</ul>
       <p><b class="${tone(h.net)}">Result: ${signed(h.net)}</b>, stack ${num(h.stackBefore)} → ${num(h.stackBefore + h.net)}${h.showdown ? ', showdown' : ''}</p>`);
+  } else if (t.type === 'log') {
+    const h = s.draft;
+    sheetEl.innerHTML = wrap(`
+      <div class="panelhead"><h2>Hand ${h.number}</h2><button class="link" data-a="close">Close</button></div>
+      ${log(h)}`);
   } else if (t.type === 'delete') {
     sheetEl.innerHTML = wrap(`
       <div class="panelhead"><h2>Delete “${esc(s.name)}”?</h2></div>
@@ -838,6 +903,9 @@ async function main() {
   const active = activeSession();
   if (active) {
     state.sessionId = active.id;
+    if (active.draft && ['decide', 'next'].includes(active.draft.phase)) active.draft = null;
+    if (['decide', 'next'].includes(active.lastDraft?.phase)) active.lastDraft = null;
+    if (active.undo?.some((d) => ['decide', 'next'].includes(d.phase))) active.undo = [];
     ensureDraft(active);
     state.view = 'hand';
   }

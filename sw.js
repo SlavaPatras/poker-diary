@@ -1,5 +1,5 @@
 // Приложение работает без интернета. При изменении файлов надо поднять VERSION.
-const VERSION = 'poker-diary-0.2.1';
+const VERSION = 'poker-diary-0.3.0';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'logic.js', 'store.js',
   'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
