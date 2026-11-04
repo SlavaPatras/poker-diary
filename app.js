@@ -1,7 +1,7 @@
 import * as L from './logic.js';
 import * as store from './store.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const MINUS = '−';
 const appEl = document.getElementById('app');
 const sheetEl = document.getElementById('sheet');
@@ -20,6 +20,9 @@ const state = {
   updateReady: false,
   storageError: false,
   anim: null,
+  cardsHidden: false,
+  boardHold: false,
+  wonHand: null,
 };
 
 const uid = () => crypto.randomUUID();
@@ -75,8 +78,13 @@ function step(work) {
   s.undo = [...(s.undo ?? []).slice(-60), before];
   work(s.draft);
   const h = s.draft;
-  if (h.street !== before.street) {
+  const closed = h.street !== before.street || (h.phase === 'result' && before.phase !== 'result');
+  if (closed) {
     state.anim = { type: 'collect', seats: prev.seats.filter((x) => x.bet > 0).map((x) => x.seat) };
+    if (h.phase === 'board') {
+      state.boardHold = true;
+      setTimeout(() => { state.boardHold = false; render(); }, 750);
+    }
   } else {
     const last = h.actions.at(-1);
     if (h.actions.length > before.actions.length && last.paid > 0) state.anim = { type: 'bet', seat: last.seat };
@@ -102,7 +110,11 @@ function finish(s, outcome, before) {
   ensureDraft(s);
   saveSession(s);
   state.sheet = null;
-  state.anim = h.net > 0 ? { type: 'win' } : null;
+  state.anim = null;
+  if (h.result === 'won') {
+    state.wonHand = h;
+    setTimeout(() => { state.wonHand = null; render(); }, 900);
+  }
   render();
 }
 
@@ -273,6 +285,7 @@ const handlers = {
     render();
   },
   log: () => { state.sheet = { type: 'log' }; renderSheet(); },
+  flipCards: () => { state.cardsHidden = !state.cardsHidden; render(); },
 
   // Стол
   menu: () => { state.sheet = { type: 'menu' }; renderSheet(); },
@@ -486,50 +499,86 @@ const EMBLEM = `<svg class="emblem" viewBox="0 0 200 200" aria-hidden="true">
   <path fill="#000" d="M100 36c10 20 52 42 52 74 0 18-14 28-27 28-8 0-14-3-19-8 2 14 7 22 18 30H76c11-8 16-16 18-30-5 5-11 8-19 8-13 0-27-10-27-28 0-32 42-54 52-74z"/>
 </svg>`;
 
+const CENTER = { x: 50, y: 49 };
+
 function seatPoint(h, seat) {
   const offset = ((seat - h.seat) % h.players + h.players) % h.players;
   const angle = Math.PI / 2 + (offset * 2 * Math.PI) / h.players;
   return { x: 50 + 39 * Math.cos(angle), y: 49 + 43 * Math.sin(angle), hero: offset === 0 };
 }
-const betPoint = (p) => (p.hero
-  ? { x: 34, y: 74 }
-  : { x: 50 + (p.x - 50) * 0.6, y: 49 + (p.y - 49) * 0.66 });
 
-const CHIP_COLORS = ['#f0a593', '#f2c53d', '#2f4fc4', '#6b3fa0', '#f4efe4'];
-const chipColor = (amount, bb) => CHIP_COLORS.at(Math.min(4, Math.floor(Math.log2(Math.max(1, amount / bb) + 1))));
-const chipDot = (color) => `<i class="chip" style="--c:${color}"></i>`;
-const fly = (from, to, color) => `<span class="fly" style="--x0:${from.x}%;--y0:${from.y}%;--x1:${to.x}%;--y1:${to.y}%;--c:${color}"></span>`;
+// Точка на прямой от игрока к центру стола: всё лежит ровно перед ним.
+const towardCenter = (p, share) => ({ x: p.x + (CENTER.x - p.x) * share, y: p.y + (CENTER.y - p.y) * share });
+const betPoint = (p) => towardCenter(p, p.hero ? 0.38 : 0.54);
+const backsPoint = (p) => towardCenter(p, 0.33);
 
-function tableView(h) {
+// Общие карты широкие, поэтому их ряд сдвигается туда, где нет боковых мест.
+function boardY(h) {
+  const sides = [];
+  for (let seat = 1; seat <= h.players; seat += 1) {
+    const p = seatPoint(h, seat);
+    if (p.x < 30) sides.push(p.y);
+  }
+  const free = [49, 46, 52, 43, 55, 40, 58, 37, 61, 34, 64].find((y) => sides.every((v) => Math.abs(v - y) >= 12.5));
+  return free ?? 49;
+}
+
+const CHIP_COLORS = ['#f4efe4', '#f0a593', '#f2c53d', '#2f4fc4', '#6b3fa0'];
+const chipCount = (amount, bb) => Math.min(8, 1 + Math.floor(Math.log2(Math.max(1, amount / (bb / 2)))));
+
+function pile(amount, bb) {
+  const count = chipCount(amount, bb);
+  const chips = Array.from({ length: count }, (_, i) => {
+    const color = CHIP_COLORS.at(Math.min(4, Math.floor(i / 2)));
+    return `<i class="chip" style="--c:${color};bottom:${i * 3}px"></i>`;
+  }).join('');
+  return `<span class="pile" style="height:${15 + (count - 1) * 3}px">${chips}</span>`;
+}
+
+const fly = (from, to, color, delay = 0) =>
+  `<span class="fly" style="--x0:${from.x}%;--y0:${from.y}%;--x1:${to.x}%;--y1:${to.y}%;--c:${color};animation-delay:${delay}ms"></span>`;
+
+function tableView(h, { anim = null } = {}) {
   const st = L.tableState(h);
-  const anim = state.anim;
-  state.anim = null;
-  const center = { x: 50, y: 49 };
+  const by = boardY(h);
+  const center = { x: 50, y: Math.min(by + 17, 68) };
+  const showPile = h.phase === 'result' || h.phase === 'done' ? 0 : st.seats.reduce((a, p) => a + p.bet, 0);
+  const middle = st.pot - showPile;
   const seats = st.seats.map((p) => {
     const at = seatPoint(h, p.seat);
     const word = p.folded ? 'Folded' : p.allin ? 'All-in' : p.last ? { check: 'Check', call: 'Call', bet: 'Bet', raise: 'Raise' }[p.last.type] ?? '' : '';
     const cls = [at.hero ? 'me' : '', p.folded ? 'out' : '', st.actor === p.seat ? 'acting' : ''].join(' ');
-    return `<div class="tseat ${cls}" style="left:${at.x}%;top:${at.y}%"><b>${at.hero ? 'You' : p.position}</b>${at.hero ? `<small>${p.position}</small>` : `<small>${word || '&nbsp;'}</small>`}</div>`;
+    return `<div class="tseat ${cls}" style="left:${at.x}%;top:${at.y}%"><b>${at.hero ? 'You' : p.position}</b><small>${at.hero ? p.position : word || '&nbsp;'}</small></div>`;
   }).join('');
-  const bets = st.seats.filter((p) => p.bet > 0).map((p) => {
+  const backs = st.seats.filter((p) => !p.folded && p.seat !== h.seat).map((p) => {
+    const spot = backsPoint(seatPoint(h, p.seat));
+    return `<div class="tbacks" style="left:${spot.x}%;top:${spot.y}%"><i></i><i></i></div>`;
+  }).join('');
+  const bets = showPile === 0 ? '' : st.seats.filter((p) => p.bet > 0).map((p) => {
     const spot = betPoint(seatPoint(h, p.seat));
-    return `<div class="tbet" style="left:${spot.x}%;top:${spot.y}%">${chipDot(chipColor(p.bet, h.bb))}${p.bet}</div>`;
+    return `<div class="tbet" style="left:${spot.x}%;top:${spot.y}%">${pile(p.bet, h.bb)}<span>${p.bet}</span></div>`;
   }).join('');
   let flying = '';
   if (anim?.type === 'bet') {
     const from = seatPoint(h, anim.seat);
-    flying = fly(from, betPoint(from), CHIP_COLORS[1]);
+    flying = [0, 1].map((i) => fly(from, betPoint(from), CHIP_COLORS[2], i * 60)).join('');
   } else if (anim?.type === 'collect') {
-    flying = anim.seats.map((seat, i) => fly(betPoint(seatPoint(h, seat)), center, CHIP_COLORS[i % 5])).join('');
+    flying = anim.seats.flatMap((seat) => [0, 1, 2].map((i) =>
+      fly(betPoint(seatPoint(h, seat)), center, CHIP_COLORS.at((seat + i) % 5), i * 70))).join('');
   } else if (anim?.type === 'win') {
-    flying = [0, 1, 2, 3].map((i) => fly(center, seatPoint(h, h.seat), CHIP_COLORS[i])).join('');
+    flying = [0, 1, 2, 3, 4, 5].map((i) => fly(center, seatPoint(h, h.seat), CHIP_COLORS.at(i % 5), i * 60)).join('');
   }
   const board = [0, 1, 2, 3, 4].map((i) => miniCard(h.board[i])).join('');
-  return `<div class="felt">
+  const hidden = state.cardsHidden && h.cards.length;
+  const mine = hidden ? '<span class="pc back"></span><span class="pc back"></span>' : [0, 1].map((i) => miniCard(h.cards[i])).join('');
+  const heap = middle > 0 && anim?.type !== 'win'
+    ? `<div class="theap" style="left:${center.x}%;top:${center.y}%">${pile(middle, h.bb)}${pile(middle / 2, h.bb)}</div>` : '';
+  return `<div class="felt ${h.players > 6 ? 'many' : ''}">
     <div class="rim">${EMBLEM}</div>
-    <div class="tcenter"><div class="tboard">${board}</div><div class="tpot">Pot ${num(st.pot)}</div></div>
-    ${bets}${seats}${flying}
-    <div class="tcards">${[0, 1].map((i) => miniCard(h.cards[i])).join('')}</div>
+    <div class="tboard" style="top:${by}%">${board}</div>
+    ${heap}${backs}${bets}${seats}${flying}
+    <div class="tpot"><small>Pot</small>${num(st.pot)}</div>
+    <button class="tcards" data-a="flipCards" aria-label="${hidden ? 'Show my cards' : 'Hide my cards'}">${mine}</button>
   </div>`;
 }
 
@@ -574,7 +623,7 @@ function handView(s) {
       <button data-a="undo" ${canUndo ? '' : 'disabled'}>Undo</button></div>
     </div>`;
 
-  if (h.phase === 'cards') {
+  if (h.phase === 'cards' && !state.wonHand) {
     const lastLine = last && s.lastDraft
       ? `<div class="lasthand"><span>Hand ${last.number}: ${signed(last.net)}</span><button class="link small" data-a="undoHand">Restore</button></div>` : '';
     state.anim = null;
@@ -583,12 +632,22 @@ function handView(s) {
       <div class="handfoot">${lastLine}<div class="choices"><button class="act red" data-a="fold">Fold</button>
       <button class="act low" data-a="skipCards">No cards</button></div></div></div>`;
   }
-  if (h.phase === 'board') {
+  if (h.phase === 'board' && !state.boardHold) {
     const left = L.boardNeeded(h) - h.board.length;
     state.anim = null;
     return `<div class="hand">${header}${rail(h)}
       <div class="handbody"><p class="prompt">${L.STREET_NAMES[h.street]}: ${left === 1 ? 'pick a card' : `pick ${left} more`}</p>${picker(h)}</div>
       <div class="handfoot"><button class="act low" style="width:100%" data-a="skipBoard">Skip cards</button></div></div>`;
+  }
+  if (state.wonHand) {
+    return `<div class="hand">${header}${tableView(state.wonHand, { anim: { type: 'win' } })}
+      <div class="handfoot"><p class="prompt">You won ${num(state.wonHand.collected)}</p></div></div>`;
+  }
+  const anim = state.anim;
+  state.anim = null;
+  if (h.phase === 'board' && state.boardHold) {
+    return `<div class="hand">${header}${tableView(h, { anim })}
+      <div class="handfoot"><p class="prompt">${L.STREET_NAMES[h.street]}</p></div></div>`;
   }
   let foot = actionBar(h);
   if (h.phase === 'result') {
@@ -597,7 +656,7 @@ function handView(s) {
       <button class="act red" data-a="lost">Lost<small>${MINUS}${L.invested(h)}</small></button>
       <button class="act" data-a="collect" data-v="split">Split pot</button></div>`;
   }
-  return `<div class="hand">${header}${tableView(h)}<div class="handfoot">${foot}</div></div>`;
+  return `<div class="hand">${header}${tableView(h, { anim })}<div class="handfoot">${foot}</div></div>`;
 }
 
 function homeView() {
