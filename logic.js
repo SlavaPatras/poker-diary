@@ -265,6 +265,34 @@ export function sessionSummary(session, hands) {
   };
 }
 
+// Японские свечи: результат вечера относительно старта, сгруппированный по равным отрезкам времени.
+export function stackCandles(session, hands, slots = 24) {
+  const start = session.startedAt;
+  const end = Math.max(session.endedAt ?? start, hands.at(-1)?.endedAt ?? start, start + 1);
+  const items = [
+    ...hands.map((h) => ({ at: h.endedAt, delta: h.net, dip: h.invested, hand: h.number })),
+    ...(session.stackEvents ?? []).filter((e) => e.type === 'correction')
+      .map((e) => ({ at: e.at ?? end, delta: e.amount, dip: 0, hand: null })),
+  ].sort((a, b) => a.at - b.at);
+  const span = (end - start) / slots;
+  const candles = new Map();
+  let run = 0;
+  for (const item of items) {
+    const index = Math.min(slots - 1, Math.max(0, Math.floor((item.at - start) / span)));
+    const open = run;
+    run += item.delta;
+    const candle = candles.get(index) ?? {
+      index, at: start + (index + 0.5) * span, open, close: run, high: open, low: open, hands: [],
+    };
+    candle.close = run;
+    candle.high = Math.max(candle.high, open, run);
+    candle.low = Math.min(candle.low, open - item.dip, run);
+    if (item.hand !== null) candle.hands.push(item.hand);
+    candles.set(index, candle);
+  }
+  return { start, end, slots, candles: [...candles.values()] };
+}
+
 // Одна рука после всех поправок: олл-ин считается тем действием, которым был.
 const kind = (a) => a.as ?? a.type;
 

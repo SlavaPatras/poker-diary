@@ -1,7 +1,7 @@
 import * as L from './logic.js';
 import * as store from './store.js';
 
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const MINUS = '−';
 const appEl = document.getElementById('app');
 const sheetEl = document.getElementById('sheet');
@@ -774,6 +774,57 @@ function chart(points, title, baseline) {
     </svg><p class="charttip">${esc(end.label)}</p></div>`;
 }
 
+const clockText = (t) => new Date(t).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+
+function niceStep(range) {
+  const rough = range / 4;
+  const power = 10 ** Math.floor(Math.log10(rough));
+  return [1, 2, 5, 10].map((m) => m * power).find((v) => v >= rough);
+}
+
+// Слева результат относительно старта, снизу время вечера.
+function candleChart(s, hands) {
+  const { start, end, slots, candles } = L.stackCandles(s, hands);
+  if (!candles.length) return '<p class="muted">Not enough data for a chart yet.</p>';
+  const w = 340, h = 200, left = 40, right = 6, top = 8, bottom = 22;
+  const lows = Math.min(0, ...candles.map((c) => c.low));
+  const highs = Math.max(0, ...candles.map((c) => c.high));
+  const step = niceStep(highs - lows || 10);
+  const lo = Math.floor(lows / step) * step;
+  const hi = Math.ceil(highs / step) * step;
+  const y = (v) => top + (1 - (v - lo) / (hi - lo)) * (h - top - bottom);
+  const x = (t) => left + ((t - start) / (end - start)) * (w - left - right);
+  const ticks = [];
+  for (let v = lo; v <= hi + step / 2; v += step) ticks.push(v);
+  const grid = ticks.map((v) => `<line x1="${left}" x2="${w - right}" y1="${y(v)}" y2="${y(v)}" stroke="${v === 0 ? '#a89f90' : '#2c2820'}" stroke-width="1" ${v === 0 ? 'stroke-dasharray="4 4"' : ''}/>
+    <text x="${left - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#a89f90">${signed(v)}</text>`).join('');
+  const times = [start, (start + end) / 2, end].map((t, i) =>
+    `<text x="${x(t)}" y="${h - 6}" text-anchor="${['start', 'middle', 'end'][i]}" font-size="11" fill="#a89f90">${clockText(t)}</text>`).join('');
+  const width = Math.min(10, Math.max(3, ((w - left - right) / slots) * 0.72));
+  const bars = candles.map((c) => {
+    const up = c.close >= c.open;
+    const color = up ? '#26b56a' : '#e5484d';
+    const cx = x(c.at);
+    const yTop = y(Math.max(c.open, c.close));
+    const height = Math.max(1.5, y(Math.min(c.open, c.close)) - yTop);
+    return `<line x1="${cx}" x2="${cx}" y1="${y(c.high)}" y2="${y(c.low)}" stroke="${color}" stroke-width="1.5"/>
+      <rect x="${cx - width / 2}" y="${yTop}" width="${width}" height="${height}" rx="1.5" fill="${color}"/>`;
+  }).join('');
+  const label = (c) => {
+    const change = c.close - c.open;
+    const which = c.hands.length === 1 ? `hand ${c.hands[0]}` : c.hands.length ? `hands ${c.hands[0]}–${c.hands.at(-1)}` : 'correction';
+    return `${clockText(c.at)}, ${which}: ${signed(change)}, session ${signed(c.close)}`;
+  };
+  const points = candles.map((c) => ({ x: x(c.at), label: label(c) }));
+  const end0 = points.at(-1);
+  return `<div class="chart" data-points="${esc(JSON.stringify(points))}">
+    <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Session result by time, from ${clockText(start)} to ${clockText(end)}">
+      ${grid}${times}
+      <line class="cross" x1="${end0.x}" x2="${end0.x}" y1="${top}" y2="${h - bottom}" stroke="#55c2ff" stroke-width="1" opacity=".5"/>
+      ${bars}
+    </svg><p class="charttip">${esc(end0.label)}</p></div>`;
+}
+
 function sessionView(s) {
   const hands = handsOf(s.id);
   const sum = L.sessionSummary(s, hands);
@@ -783,12 +834,9 @@ function sessionView(s) {
   if (state.summaryTab === 'overview') {
     const row = (name, value) => `<div class="stat"><span>${name}</span><b>${value}</b></div>`;
     const corrections = L.correctionsTotal(s);
-    const points = [{ y: s.startStack, label: `Start: ${num(s.startStack)}` }, ...hands.map((h) => ({
-      y: h.stackBefore + h.net, label: `Hand ${h.number}: stack ${num(h.stackBefore + h.net)}`,
-    }))];
     body = `<div class="bigresult ${tone(sum.result)}">${signed(sum.result)} lei</div>
       <p class="muted">${signed(sum.resultBB, 1)} BB</p>
-      <h2>Stack chart</h2>${chart(points, 'Stack by hand', s.startStack)}
+      <h2>Stack chart</h2>${candleChart(s, hands)}
       <h2>Details</h2>
       ${row('Starting stack', num(s.startStack))}
       ${row('Rebuys', num(sum.buyIns))}
@@ -944,8 +992,11 @@ function chartPointer(event) {
   const x = ((event.clientX - rect.left) / rect.width) * 340;
   const nearest = points.reduce((a, b) => (Math.abs(b.x - x) < Math.abs(a.x - x) ? b : a));
   const dot = box.querySelector('.dot');
-  dot.setAttribute('cx', nearest.x);
-  dot.setAttribute('cy', nearest.y);
+  dot?.setAttribute('cx', nearest.x);
+  dot?.setAttribute('cy', nearest.y);
+  const cross = box.querySelector('.cross');
+  cross?.setAttribute('x1', nearest.x);
+  cross?.setAttribute('x2', nearest.x);
   box.querySelector('.charttip').textContent = nearest.label;
 }
 document.addEventListener('pointerdown', chartPointer);
