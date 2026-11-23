@@ -32,7 +32,13 @@ export function blindType(players, seat) {
   return null;
 }
 
-const nextClockwise = (seat, players) => (seat >= players ? 1 : seat + 1);
+// Раздача глазами игрока: свои карты, ситуация, свои решения и ставки соперников одним числом.
+export const POT_SITUATIONS = ['open', 'limp', 'raise', 'threebet'];
+
+export function defaultOpponents(players, situation) {
+  if (situation === 'limp') return Math.min(2, players - 1);
+  return 1;
+}
 
 export function newHand({ id, session, number, players, seat, stack, now }) {
   const hand = {
@@ -47,8 +53,10 @@ export function newHand({ id, session, number, players, seat, stack, now }) {
     stackBefore: stack,
     cards: [],
     board: [],
-    raisedBefore: false,
-    actions: [],
+    situation: 'open',
+    opponents: defaultOpponents(players, 'open'),
+    potAdjust: 0,
+    decisions: [],
     street: 'preflop',
     phase: 'cards',
     showdown: false,
@@ -56,106 +64,127 @@ export function newHand({ id, session, number, players, seat, stack, now }) {
     collected: 0,
     invested: 0,
     net: 0,
-    pot: 0,
     startedAt: now,
     endedAt: null,
   };
-  for (let number = 1; number <= players; number += 1) {
-    const blind = blindType(players, number);
-    if (!blind) continue;
-    const size = blind === 'sb' ? session.sb : session.bb;
-    const hero = number === seat;
-    const amount = hero ? Math.min(size, stack) : size;
-    hand.actions.push({
-      street: 'preflop', who: hero ? 'hero' : 'villain', seat: number,
-      pos: positionFor(players, number), type: 'blind', to: amount, paid: amount,
-    });
+  const blind = blindType(players, seat);
+  if (blind) {
+    const amount = Math.min(blind === 'sb' ? session.sb : session.bb, stack);
+    hand.decisions.push({ street: 'preflop', who: 'hero', action: 'blind', to: amount, paid: amount });
   }
   return hand;
 }
 
-const heroActions = (h, street) =>
-  h.actions.filter((a) => a.who === 'hero' && (!street || a.street === street));
+const heroMoves = (h, street) =>
+  h.decisions.filter((d) => d.who === 'hero' && (!street || d.street === street));
 
-export const invested = (h) => heroActions(h).reduce((sum, a) => sum + a.paid, 0);
+export const invested = (h) => heroMoves(h).reduce((sum, d) => sum + d.paid, 0);
 export const stackLeft = (h) => h.stackBefore - invested(h);
 export const heroStreetTotal = (h, street = h.street) =>
-  heroActions(h, street).reduce((sum, a) => sum + a.paid, 0);
+  heroMoves(h, street).reduce((sum, d) => sum + d.paid, 0);
+export const hasDecided = (h) => h.decisions.some((d) => d.who === 'hero' && d.action !== 'blind');
 
-// Пока никто не сделал ход, настройки стола ещё можно менять.
-export const hasDecided = (h) => h.actions.some((a) => a.type !== 'blind' && !a.pre);
+const oppTo = (h, street = h.street) =>
+  Math.max(0, ...h.decisions.filter((d) => d.who === 'opp' && d.street === street).map((d) => d.to));
 
-// Полная картина стола восстанавливается из записанных действий.
-export function tableState(h) {
-  const n = h.players;
-  const seats = Array.from({ length: n }, (_, i) => ({
-    seat: i + 1, position: positionFor(n, i + 1), folded: false, allin: false, bet: 0, total: 0, last: null,
-  }));
-  const at = (seat) => seats[seat - 1];
-  const street = h.street;
-  let bet = street === 'preflop' ? h.bb : 0;
-  const acted = new Set();
-  let lastSeat = null;
+export function facingTo(h) {
+  const opp = oppTo(h);
+  return h.street === 'preflop' ? Math.max(h.bb, opp) : opp;
+}
+export const toCall = (h) => Math.max(0, Math.min(facingTo(h) - heroStreetTotal(h), stackLeft(h)));
 
-  for (const a of h.actions) {
-    if (!a.seat || a.pre) continue;
-    const seat = at(a.seat);
-    seat.total += a.paid;
-    if (a.type === 'fold') seat.folded = true;
-    if (a.type === 'allin') seat.allin = true;
-    if (a.street !== street) continue;
-    seat.bet += a.paid;
-    if (a.type === 'blind') continue;
-    seat.last = a;
-    lastSeat = a.seat;
-    acted.add(a.seat);
-    if (seat.bet > bet) {
-      bet = seat.bet;
-      acted.clear();
-      acted.add(a.seat);
+// Примерный банк: блайнды, свои фишки, ставки соперников по одному разу и ручная поправка.
+export function potSize(h) {
+  let pot = h.sb + h.bb + h.potAdjust;
+  for (const d of h.decisions) {
+    if (d.who === 'hero' && d.action !== 'blind') pot += d.paid;
+  }
+  for (const street of STREETS) {
+    let last = 0;
+    for (const d of h.decisions.filter((x) => x.who === 'opp' && x.street === street)) {
+      pot += Math.max(0, d.to - last);
+      last = Math.max(last, d.to);
     }
   }
-
-  if (h.stackBefore - seats[h.seat - 1].total <= 0) seats[h.seat - 1].allin = true;
-  const canAct = (s) => !s.folded && !s.allin;
-  const open = seats.filter(canAct);
-  const needs = (s) => canAct(s) && (!acted.has(s.seat) || s.bet < bet);
-  const alone = open.length <= 1 && open.every((s) => s.bet >= bet);
-  let first = street === 'preflop' ? (n === 2 ? 1 : nextClockwise(3, n)) : 2;
-  if (lastSeat) first = nextClockwise(lastSeat, n);
-  let actor = null;
-  if (!alone) {
-    for (let i = 0, seat = first; i < n; i += 1, seat = nextClockwise(seat, n)) {
-      if (needs(at(seat))) { actor = seat; break; }
-    }
-  }
-  return {
-    seats, street, bet, actor,
-    pot: seats.reduce((sum, s) => sum + s.total, 0),
-    active: seats.filter((s) => !s.folded).length,
-    hero: at(h.seat),
-  };
+  return pot;
 }
 
-export function optionsFor(h, seat) {
-  const st = tableState(h);
-  const owes = st.bet > st.seats[seat - 1].bet;
+export function setPot(h, value) {
+  h.potAdjust += value - potSize(h);
+}
+
+export function setSituation(h, situation, raiseTo = null) {
+  h.decisions = h.decisions.filter((d) => !d.pre);
+  h.situation = situation;
+  if (!h.oppsTouched) h.opponents = defaultOpponents(h.players, situation);
+  if (situation === 'raise' || situation === 'threebet') {
+    const to = raiseTo ?? h.bb * (situation === 'raise' ? 3 : 9);
+    h.decisions.push({ street: 'preflop', who: 'opp', action: situation, to, pre: true });
+  }
+}
+
+export function setOpponents(h, n) {
+  h.opponents = Math.min(h.players - 1, Math.max(1, n));
+  h.oppsTouched = true;
+}
+
+export function heroOptions(h) {
+  const owes = toCall(h) > 0;
+  if (stackLeft(h) <= 0) return [];
   if (owes) return ['fold', 'call', 'raise', 'allin'];
-  return ['check', st.bet > 0 ? 'raise' : 'bet', 'allin'];
+  return ['check', h.street === 'preflop' ? 'raise' : 'bet', 'allin'];
 }
 
-// Для быстрого сброса с первого экрана: остальные ходы до тебя тогда не вводятся.
-export function setRaisedBefore(h, value) {
-  h.actions = h.actions.filter((a) => !a.pre);
-  h.raisedBefore = value;
-  if (value) h.actions.push({ street: 'preflop', who: 'villain', type: 'raise', to: null, pre: true });
+const KIND = { raise: 'raise', bet: 'raise', allin: 'raise', call: 'call', check: 'check', fold: 'fold' };
+
+// Оценка решения: по таблице до флопа, по шансам банка после.
+export function gradeDecision(h, action, { advice = null, equity = null } = {}) {
+  const kind = KIND[action];
+  if (h.street === 'preflop') {
+    if (!advice) return null;
+    const ok = kind === advice || (advice === 'fold' && kind === 'check') || (advice === 'check' && kind === 'fold' && toCall(h) === 0);
+    return ok ? 'good' : 'bad';
+  }
+  const price = toCall(h);
+  if (price <= 0 || equity === null) return null;
+  const need = price / (potSize(h) + price);
+  if (kind === 'fold') return equity < need ? 'good' : 'bad';
+  return equity >= need ? 'good' : 'bad';
 }
 
-function advance(h) {
-  const st = tableState(h);
-  if (st.hero.folded) return;
-  if (st.active === 1) { h.autoWin = true; return; }
-  if (st.actor !== null) { h.phase = 'table'; return; }
+// to — сумма игрока на этой улице («до»). info — совет и шанс на момент решения.
+export function heroAct(h, action, to = null, info = {}) {
+  const total = heroStreetTotal(h);
+  const left = stackLeft(h);
+  const price = toCall(h);
+  const pot = potSize(h);
+  const record = {
+    street: h.street, who: 'hero', action, to: total, paid: 0,
+    advice: info.advice ?? null, equity: info.equity ?? null,
+    need: price > 0 ? price / (pot + price) : null,
+    grade: gradeDecision(h, action, info),
+  };
+  if (action === 'call') record.paid = price;
+  else if (action === 'allin') record.paid = left;
+  else if (action === 'raise' || action === 'bet') record.paid = Math.min(Math.max(0, to - total), left);
+  record.to = total + record.paid;
+  if (record.paid > 0 && record.paid === left && action !== 'allin') { record.as = action; record.action = 'allin'; }
+  h.decisions.push(record);
+  h.phase = action === 'fold' ? 'done' : 'next';
+}
+
+export function opponentBet(h, to) {
+  const action = heroStreetTotal(h) > 0 || oppTo(h) > 0 ? 'raise' : 'bet';
+  h.decisions.push({ street: h.street, who: 'opp', action, to: Math.max(to, facingTo(h)) });
+  // Рейз в ответ на твой ход до флопа меняет ситуацию для следующего совета.
+  if (h.street === 'preflop' && hasDecided(h)) {
+    const raised = heroMoves(h, 'preflop').some((d) => KIND[d.as ?? d.action] === 'raise' && d.action !== 'blind');
+    h.situation = raised ? 'threebet' : 'raise';
+  }
+  h.phase = 'decide';
+}
+
+export function nextStreet(h) {
   const index = STREETS.indexOf(h.street);
   if (index === STREETS.length - 1) {
     h.showdown = true;
@@ -166,67 +195,21 @@ function advance(h) {
   h.phase = 'board';
 }
 
-// to — сумма игрока на этой улице («до»).
-export function act(h, seat, type, to) {
-  const st = tableState(h);
-  const player = st.seats[seat - 1];
-  const hero = seat === h.seat;
-  const base = {
-    street: h.street, who: hero ? 'hero' : 'villain', seat, pos: player.position,
-  };
-  if (type === 'fold' || type === 'check') {
-    h.actions.push({ ...base, type, to: player.bet, paid: 0 });
-  } else {
-    const left = hero ? stackLeft(h) : Infinity;
-    let target = player.bet + left;
-    if (type === 'call') target = st.bet;
-    else if (type !== 'allin' || !hero) target = to;
-    const paid = Math.min(Math.max(0, target - player.bet), left);
-    const total = player.bet + paid;
-    const kindOf = total <= st.bet ? 'call' : st.bet > 0 ? 'raise' : 'bet';
-    const action = { ...base, type, to: total, paid };
-    if (type === 'allin') action.as = kindOf;
-    else if (hero && paid === left && paid > 0) { action.as = type; action.type = 'allin'; }
-    h.actions.push(action);
-  }
-  advance(h);
-}
-
-export function foldToHero(h) {
-  for (let i = 0; i < h.players; i += 1) {
-    const { actor } = tableState(h);
-    if (actor === null || actor === h.seat) break;
-    h.actions.push({
-      street: h.street, who: 'villain', seat: actor, pos: positionFor(h.players, actor),
-      type: 'fold', to: 0, paid: 0,
-    });
-  }
-  advance(h);
-}
-
 export const boardNeeded = (h) => ({ flop: 3, turn: 4, river: 5 }[h.street] ?? 0);
 
 export function addBoardCard(h, card) {
   h.board.push(card);
-  if (h.board.length >= boardNeeded(h)) { h.phase = 'table'; advance(h); }
+  if (h.board.length >= boardNeeded(h)) h.phase = stackLeft(h) > 0 ? 'decide' : 'next';
 }
 
 // Пропущенные общие карты остаются пустыми, чтобы следующие улицы не сдвинулись.
 export function skipBoard(h) {
   while (h.board.length < boardNeeded(h)) h.board.push(null);
-  h.phase = 'table';
-  advance(h);
-}
-
-export function startTable(h) {
-  setRaisedBefore(h, false);
-  h.phase = 'table';
-  advance(h);
+  h.phase = stackLeft(h) > 0 ? 'decide' : 'next';
 }
 
 export function finishHand(h, { result, collected = 0, showdown = h.showdown }, now) {
-  h.pot = tableState(h).pot;
-  delete h.autoWin;
+  h.pot = potSize(h);
   h.result = result;
   h.collected = result === 'won' || result === 'split' ? collected : 0;
   h.showdown = result === 'folded' ? false : showdown;
@@ -293,38 +276,6 @@ export function stackCandles(session, hands, slots = 24) {
   return { start, end, slots, candles: [...candles.values()] };
 }
 
-// Одна рука после всех поправок: олл-ин считается тем действием, которым был.
-const kind = (a) => a.as ?? a.type;
-
-function sawFlop(h) {
-  return h.showdown || STREETS.indexOf(h.street) >= 1;
-}
-
-function firstDecision(h) {
-  const preflop = h.actions.filter((a) => a.street === 'preflop' && a.type !== 'blind');
-  const index = preflop.findIndex((a) => a.who === 'hero');
-  if (index < 0) return null;
-  const raised = preflop.slice(0, index).some((a) => a.who === 'villain' && kind(a) === 'raise');
-  return { action: preflop[index], facedRaise: raised };
-}
-
-function checkRaiseStreets(h) {
-  let chances = 0;
-  let made = 0;
-  for (const street of STREETS) {
-    const list = h.actions.filter((a) => a.street === street && a.type !== 'blind' && !a.pre);
-    const check = list.findIndex((a) => a.who === 'hero' && a.type === 'check');
-    if (check < 0) continue;
-    const villain = list.findIndex((a, i) => i > check && a.who === 'villain' && ['bet', 'raise'].includes(kind(a)));
-    if (villain < 0) continue;
-    const reply = list.find((a, i) => i > villain && a.who === 'hero');
-    if (!reply) continue;
-    chances += 1;
-    if (kind(reply) === 'raise') made += 1;
-  }
-  return { chances, made };
-}
-
 export function startingHand(cards) {
   if (!cards || cards.length < 2) return null;
   const [a, b] = [...cards].sort((x, y) => RANKS.indexOf(x[0]) - RANKS.indexOf(y[0]));
@@ -334,55 +285,21 @@ export function startingHand(cards) {
 
 const ratio = (n, d) => ({ n, d, value: d > 0 ? n / d : null });
 
-// corrections — ручные поправки стека в выбранных вечерах: входят в результат и винрейт.
-export function computeStats(hands, { corrections = 0, correctionsBB = 0, hours = 0 } = {}) {
-  let vpip = 0, pfr = 0, threeBet = 0, threeBetChances = 0;
-  let pfrWins = 0, wins = 0, winsNoShowdown = 0;
-  let checkRaises = 0, checkRaiseChances = 0;
-  let flops = 0, showdowns = 0, showdownWins = 0;
-  let net = 0, netBB = 0;
+// Насколько решения совпадали с подсказками. Старые раздачи без подсказок не учитываются.
+export function adviceStats(hands) {
+  let pre = 0, preGood = 0, post = 0, postGood = 0;
+  const followed = { hands: 0, net: 0, bb: 0 };
+  const deviated = { hands: 0, net: 0, bb: 0 };
   const positions = new Map();
   const starts = new Map();
-
+  let net = 0, netBB = 0;
   for (const h of hands) {
-    const preflop = heroActions(h, 'preflop').filter((a) => a.type !== 'blind');
-    const voluntary = preflop.some((a) => ['call', 'raise', 'bet'].includes(kind(a)));
-    const raised = preflop.some((a) => kind(a) === 'raise');
-    if (voluntary) vpip += 1;
-    if (raised) pfr += 1;
-    if (raised && h.result === 'won') pfrWins += 1;
-
-    const first = firstDecision(h);
-    if (first?.facedRaise) {
-      threeBetChances += 1;
-      if (kind(first.action) === 'raise') threeBet += 1;
-    }
-
-    if (h.result === 'won') {
-      wins += 1;
-      if (!h.showdown) winsNoShowdown += 1;
-    }
-
-    const cr = checkRaiseStreets(h);
-    checkRaiseChances += cr.chances;
-    checkRaises += cr.made;
-
-    if (sawFlop(h)) flops += 1;
-    if (h.showdown) {
-      showdowns += 1;
-      if (h.result === 'won') showdownWins += 1;
-    }
-
     net += h.net;
     netBB += h.net / h.bb;
-
-    const pos = positions.get(h.position) ?? { position: h.position, hands: 0, net: 0, netBB: 0, vpip: 0 };
+    const pos = positions.get(h.position) ?? { position: h.position, hands: 0, net: 0 };
     pos.hands += 1;
     pos.net += h.net;
-    pos.netBB += h.net / h.bb;
-    if (voluntary) pos.vpip += 1;
     positions.set(h.position, pos);
-
     const start = startingHand(h.cards);
     if (start) {
       const item = starts.get(start) ?? { hand: start, hands: 0, net: 0 };
@@ -390,28 +307,34 @@ export function computeStats(hands, { corrections = 0, correctionsBB = 0, hours 
       item.net += h.net;
       starts.set(start, item);
     }
+    if (!h.decisions) continue;
+    const graded = h.decisions.filter((d) => d.grade);
+    const preflop = graded.filter((d) => d.street === 'preflop');
+    pre += preflop.length;
+    preGood += preflop.filter((d) => d.grade === 'good').length;
+    const later = graded.filter((d) => d.street !== 'preflop');
+    post += later.length;
+    postGood += later.filter((d) => d.grade === 'good').length;
+    if (preflop.length) {
+      const bucket = preflop.every((d) => d.grade === 'good') ? followed : deviated;
+      bucket.hands += 1;
+      bucket.net += h.net;
+      bucket.bb += h.net / h.bb;
+    }
   }
-
-  const total = hands.length;
-  const totalBB = netBB + correctionsBB;
-  const startList = [...starts.values()].sort((a, b) => b.net - a.net);
+  const order = POSITIONS[10];
+  const list = [...starts.values()].sort((a, b) => b.net - a.net);
   return {
-    hands: total,
-    net: net + corrections,
-    vpip: ratio(vpip, total),
-    pfr: ratio(pfr, total),
-    threeBet: ratio(threeBet, threeBetChances),
-    pfrWin: ratio(pfrWins, pfr),
-    winNoShowdown: ratio(winsNoShowdown, wins),
-    checkRaise: ratio(checkRaises, checkRaiseChances),
-    wtsd: ratio(showdowns, flops),
-    wsd: ratio(showdownWins, showdowns),
-    bb100: total > 0 ? (totalBB / total) * 100 : null,
-    perHour: hours > 0 ? (net + corrections) / hours : null,
-    positions: POSITIONS[10].concat('BB').filter((p, i, all) => all.indexOf(p) === i)
-      .map((p) => positions.get(p)).filter(Boolean),
-    bestHands: startList.filter((s) => s.net > 0).slice(0, 5),
-    worstHands: startList.filter((s) => s.net < 0).slice(-5).reverse(),
+    hands: hands.length,
+    net,
+    bb100: hands.length ? (netBB / hands.length) * 100 : null,
+    preflop: ratio(preGood, pre),
+    postflop: ratio(postGood, post),
+    followed,
+    deviated,
+    positions: order.map((p) => positions.get(p)).filter(Boolean),
+    bestHands: list.filter((x) => x.net > 0).slice(0, 5),
+    worstHands: list.filter((x) => x.net < 0).slice(-5).reverse(),
   };
 }
 
@@ -425,16 +348,29 @@ export function actionText(a) {
 const cardText = (c) => (c[0] === 'T' ? '10' : c[0]) + SUIT_SYMBOLS[c[1]];
 export const cardsText = (cards) => cards.filter(Boolean).map(cardText).join(' ');
 
+const WORDS = { blind: 'blind', check: 'check', call: 'call', bet: 'bet', raise: 'raise', allin: 'all-in', fold: 'fold', threebet: '3-bet' };
+
+function decisionText(d) {
+  if (d.who === 'opp') return `${d.pre ? `${WORDS[d.action]} before you` : `opponent ${WORDS[d.action]}`} ${d.to}`;
+  const amount = ['fold', 'check'].includes(d.action) ? '' : ` ${d.action === 'blind' ? d.paid : d.to}`;
+  let note = '';
+  if (d.grade && d.street === 'preflop') note = d.grade === 'good' ? ' ✓ chart' : ` ✗ chart: ${d.advice}`;
+  else if (d.grade) note = ` ${d.grade === 'good' ? '✓' : '✗'} ${Math.round(d.equity * 100)}% vs ${Math.round(d.need * 100)}% needed`;
+  return `${WORDS[d.action]}${amount}${note}`;
+}
+
 export function handLines(h) {
   const lines = [];
   const counts = { flop: [0, 3], turn: [3, 4], river: [4, 5] };
   for (const street of STREETS) {
-    const list = h.actions.filter((a) => a.street === street && !(a.who === 'villain' && a.type === 'blind'));
+    const list = h.decisions
+      ? h.decisions.filter((d) => d.street === street).map(decisionText)
+      : (h.actions ?? []).filter((a) => a.street === street && !(a.who === 'villain' && a.type === 'blind')).map(actionText);
     const range = counts[street];
     const cards = range ? h.board.slice(range[0], range[1]) : [];
-    if (!list.length && !cards.length) continue;
-    const title = STREET_NAMES[street] + (cards.length ? ` ${cardsText(cards)}` : '');
-    lines.push({ title, text: list.map(actionText).join(', ') });
+    if (!list.length && !cards.filter(Boolean).length) continue;
+    const title = STREET_NAMES[street] + (cards.filter(Boolean).length ? ` ${cardsText(cards)}` : '');
+    lines.push({ title, text: list.join(', ') });
   }
   return lines;
 }
