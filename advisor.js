@@ -292,3 +292,40 @@ export function preflopAdvice({ cards, position, players, situation }) {
 
 // Сколько процентов нужно, чтобы колл окупался.
 export const neededEquity = (pot, toCall) => (toCall > 0 ? toCall / (pot + toCall) : 0);
+
+// Точный шанс одной руки против другой: перебор всех досок, если открыт флоп или дальше.
+export function equityVsHand(hero, opp, board = [], { iterations = 20000, random = Math.random } = {}) {
+  const h = hero.map(toInt);
+  const o = opp.map(toInt);
+  const b = board.filter(Boolean).map(toInt);
+  const used = new Set([...h, ...o, ...b]);
+  const deck = [];
+  for (let c = 0; c < 52; c += 1) if (!used.has(c)) deck.push(c);
+  let win = 0, tie = 0, total = 0;
+  const judge = (full) => {
+    const x = score7([...h, ...full]);
+    const y = score7([...o, ...full]);
+    if (x > y) win += 1;
+    else if (x === y) tie += 1;
+    total += 1;
+  };
+  const need = 5 - b.length;
+  if (need === 0) judge(b);
+  else if (need === 1) for (const c of deck) judge([...b, c]);
+  else if (need === 2) {
+    for (let i = 0; i < deck.length; i += 1) for (let j = i + 1; j < deck.length; j += 1) judge([...b, deck[i], deck[j]]);
+  } else {
+    const pool = deck.slice();
+    for (let it = 0; it < iterations; it += 1) {
+      for (let k = 0; k < need; k += 1) {
+        const i = k + Math.floor(random() * (pool.length - k));
+        [pool[k], pool[i]] = [pool[i], pool[k]];
+      }
+      judge([...b, ...pool.slice(0, need)]);
+    }
+  }
+  return (win + tie / 2) / total;
+}
+
+export const cardInts = (cards) => cards.map(toInt);
+export const handScore = (cards) => score7(cards.map(toInt));

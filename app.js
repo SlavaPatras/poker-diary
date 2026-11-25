@@ -1,8 +1,9 @@
 import * as L from './logic.js';
 import * as store from './store.js';
 import * as A from './advisor.js';
+import * as T from './trainer.js';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const MINUS = '−';
 const appEl = document.getElementById('app');
 const sheetEl = document.getElementById('sheet');
@@ -20,6 +21,9 @@ const state = {
   sheet: null,
   updateReady: false,
   storageError: false,
+  trainer: T.emptyProgress(),
+  drill: null,
+  speed: false,
 };
 
 const uid = () => crypto.randomUUID();
@@ -423,13 +427,28 @@ const handlers = {
   },
   exportJson: () => shareFile(
     `poker-diary-${new Date().toISOString().slice(0, 10)}.json`, 'application/json',
-    JSON.stringify({ app: 'poker-diary', version: 1, sessions: state.sessions, hands: state.hands }, null, 1),
+    JSON.stringify({ app: 'poker-diary', version: 1, sessions: state.sessions, hands: state.hands, trainer: state.trainer }, null, 1),
   ),
   exportCsv: () => shareFile(
     `poker-diary-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv',
     `﻿${L.csvRows(state.sessions, state.hands)}`,
   ),
   importFile: () => document.getElementById('importInput').click(),
+
+  // Тренажёр
+  drill: (el) => { startDrill(el.dataset.v); },
+  speed: () => {
+    state.speed = !state.speed;
+    try { localStorage.setItem('speed', state.speed ? '1' : '0'); } catch { /* приватный режим */ }
+    render();
+  },
+  answer: (el) => answerDrill(el.dataset.v),
+  outsAnswer: (el) => answerDrill(Number(el.dataset.v)),
+  equityAnswer: () => answerDrill(Number(document.getElementById('eqSlider').value)),
+  nextTask: () => nextTask(),
+  drillAgain: () => startDrill(state.drill.type),
+  drillExit: () => { stopTimer(); state.drill = null; state.view = 'home'; state.tab = 'trainer'; render(); },
+  resetMistakes: () => { state.trainer.mistakes = []; state.trainer.errors = {}; guard(store.putTrainer(state.trainer)); render(); },
   reload: () => location.reload(),
 };
 
@@ -457,6 +476,7 @@ async function importData(file) {
     const data = JSON.parse(await file.text());
     if (data.app !== 'poker-diary' || !Array.isArray(data.sessions) || !Array.isArray(data.hands)) throw new Error();
     await store.putMany(data.sessions, data.hands);
+    if (data.trainer) { state.trainer = { ...T.emptyProgress(), ...data.trainer }; await store.putTrainer(state.trainer); }
     const loaded = await store.load();
     state.sessions = loaded.sessions;
     state.hands = loaded.hands;
@@ -465,6 +485,157 @@ async function importData(file) {
     state.importMessage = 'This file doesn’t fit. Choose a backup saved from this app.';
   }
   render();
+}
+
+// Тренажёр
+let timer = null;
+const stopTimer = () => { clearTimeout(timer); timer = null; };
+
+function newTask(type) {
+  return type === 'preflop' ? T.preflopTask(Math.random, state.trainer.mistakes) : T.makeTask[type]();
+}
+
+function startDrill(type) {
+  stopTimer();
+  state.drill = { type, index: 0, score: 0, task: newTask(type), result: null, value: null, started: Date.now() };
+  state.view = 'drill';
+  armTimer();
+  render();
+}
+
+function armTimer() {
+  if (!state.speed) return;
+  stopTimer();
+  timer = setTimeout(() => { if (state.drill && !state.drill.result) answerDrill(null); }, 10000);
+}
+
+function answerDrill(value) {
+  const d = state.drill;
+  if (!d || d.result) return;
+  stopTimer();
+  const check = { preflop: T.checkPreflop, outs: T.checkOuts, equity: T.checkEquity, potodds: T.checkPotOdds }[d.type];
+  d.result = value === null ? { correct: false, timeout: true } : check(d.task, value);
+  d.value = value;
+  if (d.result.correct) d.score += 1;
+  T.record(state.trainer, d.task, d.result);
+  guard(store.putTrainer(state.trainer));
+  render();
+}
+
+function nextTask() {
+  const d = state.drill;
+  d.index += 1;
+  if (d.index >= T.SESSION_LENGTH) { d.done = true; render(); return; }
+  d.task = newTask(d.type);
+  d.result = null;
+  d.value = null;
+  armTimer();
+  render();
+}
+
+const bigCard = (c) => (c ? `<span class="pc big s-${c[1]}">${cardFace(c)}</span>` : '<span class="pc big blank"></span>');
+const cardRow = (cards, label) => `<div class="drow">${label ? `<span class="dlabel">${label}</span>` : ''}<div class="dcards">${cards.map(bigCard).join('')}</div></div>`;
+const accuracy = (p) => (p.recent.length ? `${Math.round((p.recent.reduce((x, y) => x + y, 0) / p.recent.length) * 100)}%` : '—');
+
+function trainerHome() {
+  const p = state.trainer;
+  const cards = Object.entries(T.EXERCISES).map(([k, e]) => {
+    const s = p[k];
+    const extra = s.attempts && (k === 'outs' || k === 'equity')
+      ? `, average miss ${(s.missTotal / s.attempts).toFixed(1)}${k === 'equity' ? '%' : ''}` : '';
+    return `<button class="exercise" data-a="drill" data-v="${k}">
+      <span class="grow"><b>${e.title}</b><span class="muted small">${e.text}</span>
+      <span class="small">${s.attempts ? `Last ${s.recent.length}: ${accuracy(s)} correct, best streak ${s.best}${extra}` : 'Not tried yet'}</span></span>
+      <span class="acc">${accuracy(s)}</span></button>`;
+  }).join('');
+  const mistakes = T.topMistakes(p);
+  return `<h1>Trainer</h1>
+    <p class="muted" style="margin-top:6px">${T.SESSION_LENGTH} tasks per round. Everything is calculated on the phone.</p>
+    <button class="toggle" style="margin-top:14px" data-a="speed" aria-pressed="${state.speed}"><span>Speed mode, 10 seconds per answer</span><i></i></button>
+    <div class="stack">${cards}</div>
+    ${mistakes.length ? `<h2>Most common preflop mistakes</h2><table><tr><th>Position</th><th>Hand</th><th>Mistakes</th></tr>
+      ${mistakes.map((m) => `<tr><td>${m.position}</td><td>${m.hand}</td><td>${m.count}</td></tr>`).join('')}</table>
+      <p class="muted small" style="margin-top:6px">Hands you miss come back more often until you get them right twice in a row.</p>
+      <button class="link small" data-a="resetMistakes">Clear mistakes</button>` : ''}`;
+}
+
+function drillQuestion(d) {
+  const t = d.task;
+  if (d.type === 'preflop') {
+    return `<div class="dpos"><span class="disc"><span>${t.position}</span><small>SLOWPLAY</small></span><span>Everyone folded to you.<br>6-max cash.</span></div>
+      ${cardRow(t.cards)}`;
+  }
+  if (d.type === 'outs') {
+    const toCome = t.board.length === 3 ? 'flop' : 'turn';
+    return `${cardRow(t.hero, 'You')}${cardRow(t.board, toCome === 'flop' ? 'Flop' : 'Turn')}
+      <p class="dq">How many cards give you a straight or a flush?</p>`;
+  }
+  if (d.type === 'equity') {
+    return `${cardRow(t.hero, 'You')}${cardRow(t.opp, 'Opponent')}${t.board.length ? cardRow(t.board, 'Flop') : ''}
+      <p class="dq">Your chance to win if all cards are dealt?</p>`;
+  }
+  const what = A.describeHand(t.hero, t.board);
+  return `${cardRow(t.hero, 'You')}${cardRow(t.board, t.allIn ? 'Flop' : 'Turn')}
+    <div class="dpot"><span>Pot <b>${t.pot}</b></span><span>Opponent bets <b>${t.bet}</b></span></div>
+    <p class="dq">${t.allIn ? 'Opponent is all-in, two cards to come.' : 'One card to come.'} Opponent shows a made hand. You have ${esc(what.draws.join(' and ') || what.made.toLowerCase())}.</p>`;
+}
+
+function drillControls(d) {
+  if (d.type === 'preflop') {
+    return '<div class="choices"><button class="act red" data-a="answer" data-v="fold">Fold</button><button class="act gold" data-a="answer" data-v="raise">Raise</button></div>';
+  }
+  if (d.type === 'potodds') {
+    return '<div class="choices"><button class="act red" data-a="answer" data-v="fold">Fold</button><button class="act ivory" data-a="answer" data-v="call">Call</button></div>';
+  }
+  if (d.type === 'outs') {
+    return `<div class="numgrid">${Array.from({ length: 20 }, (_, i) => `<button data-a="outsAnswer" data-v="${i + 1}">${i + 1}</button>`).join('')}</div>`;
+  }
+  return `<div class="slider"><b id="eqValue">50%</b><input id="eqSlider" type="range" min="0" max="100" value="50" aria-label="Your equity guess"></div>
+    <button class="act gold" style="width:100%" data-a="equityAnswer">Check</button>`;
+}
+
+function drillFeedback(d) {
+  const t = d.task;
+  const r = d.result;
+  const head = r.timeout ? 'Time is up' : r.correct ? 'Correct' : r.close ? 'Close' : 'Not quite';
+  let detail = '';
+  if (d.type === 'preflop') {
+    detail = `Chart: <b>${t.answer === 'raise' ? 'Raise' : 'Fold'}</b>. ${esc(t.note)}.`;
+  } else if (d.type === 'outs') {
+    const toCome = t.board.length === 3 ? 2 : 1;
+    const unseen = 52 - 2 - t.board.length;
+    const dirty = t.outs.filter((o) => o.dirty).length;
+    detail = `<b>${t.answer} outs</b>${d.value !== null ? `, you said ${d.value}` : ''}.
+      <div class="outs">${t.outs.map((o) => `<span class="${o.dirty ? 'dirty' : ''}">${miniCard(o.card)}</span>`).join('')}</div>
+      ${dirty ? `<p class="small muted">Outlined cards pair the board: they help you but can give the opponent a full house.</p>` : ''}
+      <p class="small">Rule of ${toCome === 2 ? 4 : 2}: about ${T.ruleOfTwoFour(t.answer, toCome)}%. Exact chance to hit by the river: ${percent(T.exactOutsChance(t.answer, unseen, toCome))}.</p>`;
+  } else if (d.type === 'equity') {
+    detail = `Exact equity <b>${percent(t.answer)}</b>${d.value !== null ? `, you said ${d.value}%, off by ${r.miss}` : ''}.
+      <p class="small muted">Within 5% counts as correct.</p>`;
+  } else {
+    detail = `You need <b>${percent(t.need)}</b> (call ${t.bet} to win ${t.pot + t.bet}) and you have <b>${percent(t.equity)}</b> with ${t.outs} outs.
+      Answer: <b>${t.answer === 'call' ? 'Call' : 'Fold'}</b>${t.close ? ', but it is so close that both answers count' : ''}.
+      ${cardRow(t.opp, 'Opponent had')}`;
+  }
+  return `<div class="feedback ${r.correct ? 'ok' : 'bad'}"><b class="fhead">${head}</b><div>${detail}</div></div>`;
+}
+
+function drillView() {
+  const d = state.drill;
+  const e = T.EXERCISES[d.type];
+  if (d.done) {
+    const p = state.trainer[d.type];
+    return `<div class="topbar"><button class="link" data-a="drillExit">Back</button><h1>${e.title}</h1></div>
+      <div class="page" style="padding-top:0"><div class="bigresult">${d.score} of ${T.SESSION_LENGTH}</div>
+      <p class="muted">Last ${p.recent.length} answers: ${accuracy(p)} correct, best streak ${p.best}.</p>
+      <div class="stack" style="margin-top:20px"><button class="primary" data-a="drillAgain">Another round</button>
+      <button class="secondary" data-a="drillExit">All exercises</button></div></div>`;
+  }
+  const timerBar = state.speed && !d.result ? `<div class="timer"><i style="animation-duration:10s" key="${d.index}"></i></div>` : '';
+  return `<div class="topbar"><button class="link" data-a="drillExit">Back</button><h1>${e.title}</h1><span class="muted">${d.index + 1}/${T.SESSION_LENGTH}</span></div>
+    ${timerBar}
+    <div class="page drill" style="padding-top:4px">${drillQuestion(d)}${d.result ? drillFeedback(d) : ''}</div>
+    <div class="formfoot">${d.result ? '<button class="primary" data-a="nextTask">Next</button>' : drillControls(d)}</div>`;
 }
 
 // Отрисовка
@@ -607,7 +778,7 @@ function handView(s) {
 
 function homeView() {
   const active = activeSession();
-  const nav = `<nav class="nav">${[['tables', 'Tables'], ['stats', 'Stats'], ['data', 'Data']]
+  const nav = `<nav class="nav">${[['tables', 'Diary'], ['trainer', 'Trainer'], ['stats', 'Stats'], ['data', 'Data']]
     .map(([k, t]) => `<button data-a="tab" data-v="${k}" aria-current="${state.tab === k}">${t}</button>`).join('')}</nav>`;
   let body = '';
   if (state.tab === 'tables') {
@@ -622,6 +793,8 @@ function homeView() {
         return `<button class="row" data-a="open" data-v="${s.id}"><span class="grow"><span class="title" style="display:block">${esc(s.name)}</span>
           <span class="muted small">${dateText(s.startedAt)}, hands: ${sum.hands}</span></span><b class="${tone(sum.result)}">${signed(sum.result)}</b></button>`;
       }).join('')}`;
+  } else if (state.tab === 'trainer') {
+    body = trainerHome();
   } else if (state.tab === 'stats') {
     body = overallStats();
   } else {
@@ -897,6 +1070,7 @@ function render() {
   if (state.view === 'setup') html = setupView();
   else if (state.view === 'hand') html = handView(current());
   else if (state.view === 'session') html = sessionView(current());
+  else if (state.view === 'drill') html = drillView();
   else html = homeView();
   const alerts = [
     state.storageError ? '<div class="update"><span>Couldn’t save. Check free space on your phone.</span></div>' : '',
@@ -920,6 +1094,7 @@ document.addEventListener('click', (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  if (event.target.id === 'eqSlider') document.getElementById('eqValue').textContent = `${event.target.value}%`;
   const key = event.target.dataset.f;
   if (key) state.form[key] = event.target.value;
 });
@@ -948,11 +1123,14 @@ function chartPointer(event) {
 document.addEventListener('pointerdown', chartPointer);
 document.addEventListener('pointermove', chartPointer);
 
+try { state.speed = localStorage.getItem('speed') === '1'; } catch { /* приватный режим */ }
+
 async function main() {
   try {
     const data = await store.load();
     state.sessions = data.sessions;
     state.hands = data.hands;
+    if (data.trainer) state.trainer = { ...T.emptyProgress(), ...data.trainer };
   } catch {
     state.storageError = true;
   }

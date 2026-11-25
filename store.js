@@ -3,10 +3,14 @@ const DB_NAME = 'poker-diary';
 let db;
 
 const open = () => new Promise((resolve, reject) => {
-  const request = indexedDB.open(DB_NAME, 1);
-  request.onupgradeneeded = () => {
-    request.result.createObjectStore('sessions', { keyPath: 'id' });
-    request.result.createObjectStore('hands', { keyPath: 'id' });
+  const request = indexedDB.open(DB_NAME, 2);
+  request.onupgradeneeded = (event) => {
+    const base = request.result;
+    if (event.oldVersion < 1) {
+      base.createObjectStore('sessions', { keyPath: 'id' });
+      base.createObjectStore('hands', { keyPath: 'id' });
+    }
+    if (event.oldVersion < 2) base.createObjectStore('meta', { keyPath: 'key' });
   };
   request.onsuccess = () => resolve(request.result);
   request.onerror = () => reject(request.error);
@@ -28,7 +32,8 @@ const all = (name) => new Promise((resolve, reject) => {
 
 export async function load() {
   db = await open();
-  return { sessions: await all('sessions'), hands: await all('hands') };
+  const meta = await all('meta');
+  return { sessions: await all('sessions'), hands: await all('hands'), trainer: meta.find((m) => m.key === 'trainer')?.value ?? null };
 }
 
 export const putSession = (s) => run('sessions', (o) => o.put(s));
@@ -42,3 +47,4 @@ export const putMany = (sessions, hands) => Promise.all([
   run('sessions', (o) => sessions.forEach((s) => o.put(s))),
   run('hands', (o) => hands.forEach((h) => o.put(h))),
 ]);
+export const putTrainer = (value) => run('meta', (o) => o.put({ key: 'trainer', value }));
